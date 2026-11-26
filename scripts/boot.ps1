@@ -20,6 +20,8 @@ param(
     [switch]$Uncap,
     [switch]$Safe,
     [switch]$RayTracing,
+    [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
+    [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
     # Build and warm, but do not start the game.
     [switch]$NoLaunch,
     # Leave VICTORY_PIPELINE_ISOLATE off for the game's run.
@@ -61,11 +63,12 @@ if ($WarmShaders -and (Test-Path $shaders)) {
 
 $play = Join-Path $PSScriptRoot 'play.ps1'
 function Invoke-Play {
-    param([hashtable]$More = @{}, [switch]$Uncap, [switch]$Safe, [switch]$RayTracing)
-    $call = @{ Exe = $titleExe; More = $More }
+    param([hashtable]$More = @{}, [switch]$Uncap, [switch]$Safe, [switch]$RayTracing, [string]$Fsr4K, [string]$Console = 'series-x')
+    $call = @{ Exe = $titleExe; More = $More; Console = $Console }
     if ($Uncap) { $call.Uncap = $true }
     if ($Safe) { $call.Safe = $true }
     if ($RayTracing) { $call.RayTracing = $true }
+    if ($Fsr4K) { $call.Fsr4K = $Fsr4K }
     & $play @call
 }
 
@@ -83,5 +86,5 @@ if (-not $NoLaunch) {
     $more = @{}
     if (-not $NoIsolate) { $more.VICTORY_PIPELINE_ISOLATE = '1' }
     if ($SkipWarm) { $more.VICTORY_WARM_ON_LAUNCH = '0' }
-    Invoke-Play -More $more -Uncap:$Uncap -Safe:$Safe -RayTracing:$RayTracing
+    Invoke-Play -More $more -Uncap:$Uncap -Safe:$Safe -RayTracing:$RayTracing -Fsr4K:$Fsr4K -Console:$Console
 }

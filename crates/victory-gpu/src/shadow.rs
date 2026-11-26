@@ -5516,8 +5516,14 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;
     let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
-        host.uav_buffer(len)
+        host.uav_buffer(len).or_else(|| {
+            USED.fetch_sub(len, Ordering::Relaxed);
+            None
+        })
     } else {
+        if room {
+            USED.fetch_sub(len, Ordering::Relaxed);
+        }
         None
     };
     let buffer = match on_card {

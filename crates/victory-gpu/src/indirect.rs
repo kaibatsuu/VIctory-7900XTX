@@ -295,12 +295,23 @@ pub(crate) fn amd(device: &ID3D12Device) -> bool {
 
 /// Whether a record that does not fit in what is left of its list's budget
 /// takes the rest, so that every record after it runs empty too
-/// (`VICTORY_INDIRECT_REST=0`: it takes nothing, and the next one that fits
-/// runs). A list whose budget one garbage record empties loses all its later
-/// draws, and which record that is may differ from frame to frame. The frame
-/// line says how many records a frame are refused.
+/// (`VICTORY_INDIRECT_REST=1`; off by default: it takes nothing, and the next
+/// one that fits runs). A list whose budget one garbage record empties loses
+/// all its later draws, and which record that is may differ from frame to
+/// frame: trees, signs and far objects blinked in and out (as RYUKI-7900XT
+/// 880d34a). The frame line says how many records a frame are refused.
 fn rest() -> u32 {
-    u32::from(std::env::var("VICTORY_INDIRECT_REST").map_or(true, |v| v != "0"))
+    #[cfg(test)]
+    if let Some(rest) = TEST_REST.with(std::cell::Cell::get) {
+        return u32::from(rest);
+    }
+    u32::from(std::env::var("VICTORY_INDIRECT_REST").is_ok_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own [`rest`], whatever the environment says.
+    static TEST_REST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
@@ -2605,7 +2616,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
     /// left then, and the records as clamped.
     fn four_records_of_a_group(rest: bool) -> Option<(u32, Vec<u32>)> {
         let mut warp = WarpHarness::new()?;
-        let source = if rest { SOURCE.to_owned() } else { SOURCE.replace("REST ?", "false ?") };
+        let source = SOURCE.replace("REST ?", if rest { "true ?" } else { "false ?" });
         let clamp = make_from(&warp.device, &source).expect("the clamp must compile on WARP");
         const KIND_DRAW: u32 = 0;
         const STRIDE: u32 = 16;
@@ -2666,6 +2677,12 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
     /// small record still runs.
     #[test]
     fn host_list_budget_starts_empty_at_each_submission() {
+        // What it checks is the budget a record that does not fit uses up,
+        // with the host's own clamp (made once, by `rest` as it was then):
+        // without `VICTORY_INDIRECT_REST=1` that record takes nothing.
+        if rest() == 0 {
+            return;
+        }
         let Some(host) = super::host() else {
             return;
         };
@@ -3149,6 +3166,8 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
     /// executions is charged for each.
     #[test]
     fn warp_batch_charges_every_execution() {
+        // What it checks is the budget a record that does not fit uses up.
+        TEST_REST.with(|r| r.set(Some(true)));
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
