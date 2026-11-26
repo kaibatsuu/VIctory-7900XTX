@@ -7689,11 +7689,38 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
     }
 
+    /// The mnemonics named in `VICTORY_DISABLE_MNEMONIC` (comma-separated):
+    /// each is lowered as a no-op that writes 0 to its destination registers.
+    /// A bisect tool: the shader stays complete and compilable while the one
+    /// mnemonic whose translation makes the host driver crash is found.
+    fn disabled_mnemonics() -> &'static [String] {
+        static DISABLED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        DISABLED.get_or_init(|| {
+            std::env::var("VICTORY_DISABLE_MNEMONIC")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+    }
+
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
         let name = inst.name();
+        if Self::disabled_mnemonics().iter().any(|m| m == name) {
+            // No-op: write 0 to every register dword the instruction writes,
+            // so its result is well-defined for whoever reads it. (Side
+            // effects are VALU's none, so this is complete on its own.)
+            let zero = self.s.m.i32(0);
+            for &(_, v) in &inst.writes {
+                self.vals.insert(v, Val::I32(zero));
+            }
+            return Ok(());
+        }
         if self.x.res.waterfall.compares.contains(&(b, i)) {
             // The first lane's dwords of a waterfall loop are each lane's
             // own (see `resource::Waterfall`).

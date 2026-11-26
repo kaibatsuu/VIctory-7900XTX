@@ -609,7 +609,8 @@ fn translate_programs(container: &Container, bytes: &[u8], programs: Vec<NativeP
                         Ok(shader) => {
                             census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;
-                            check(shader, bytes, t, checks, label);
+                            let mnemonics = valu_mnemonics(&program);
+                            check(shader, bytes, &mnemonics, t, checks, label);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
                             .fail(format!("emit: {what}"), || {
@@ -679,6 +680,7 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
 fn check(
     mut shader: emit::HostShader,
     bytes: &[u8],
+    mnemonics: &[&'static str],
     t: &mut Tally,
     checks: &mut Checks,
     label: impl Fn() -> String,
@@ -708,8 +710,9 @@ fn check(
     if let Some((h, stub_ps)) = &checks.host {
         let made = if isolate_pipelines() {
             // The child re-translates the container and compiles its host
-            // pipeline; a driver crash ends the child, not this process.
-            compile_in_child(bytes).into_result()
+            // pipeline; a driver crash ends the child, not this process, and
+            // is then bisected to the one mnemonic to disable.
+            isolated_compile(bytes, mnemonics)
         } else {
             match shader.stage {
                 HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
@@ -786,26 +789,13 @@ enum CompileOutcome {
     Crashed,
 }
 
-#[cfg(windows)]
-impl CompileOutcome {
-    fn into_result(self) -> Result<(), String> {
-        match self {
-            CompileOutcome::Made => Ok(()),
-            CompileOutcome::Refused(why) => Err(why),
-            CompileOutcome::Crashed => Err(
-                "the driver crashed compiling the host pipeline (isolated in a child process)"
-                    .into(),
-            ),
-        }
-    }
-}
-
 /// Compiles `container`'s host pipeline in a child process (`pipeline-check`)
-/// and says what came of it. The container is written to a file in the
-/// system's temporary folder, read back and re-translated by the child; the
-/// child inherits the environment, so its translation matches this one's.
+/// with the mnemonics of `disabled` lowered as no-ops, and says what came of
+/// it. The container is written to a file in the cache folder, read back and
+/// re-translated by the child; the child inherits the environment, so its
+/// translation matches this one's.
 #[cfg(windows)]
-fn compile_in_child(container: &[u8]) -> CompileOutcome {
+fn compile_in_child_with(container: &[u8], disabled: &[&str]) -> CompileOutcome {
     use std::process::{Command, Stdio};
     use std::sync::atomic::AtomicU64;
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -828,14 +818,16 @@ fn compile_in_child(container: &[u8]) -> CompileOutcome {
         ));
     }
     let spawned = std::env::current_exe().ok().and_then(|exe| {
-        Command::new(exe)
-            .arg("pipeline-check")
+        let mut cmd = Command::new(exe);
+        cmd.arg("pipeline-check")
             .arg(&file)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()
+            .stderr(Stdio::null());
+        if !disabled.is_empty() {
+            cmd.env("VICTORY_DISABLE_MNEMONIC", disabled.join(","));
+        }
+        cmd.spawn().ok()
     });
     let outcome = match spawned {
         Some(mut child) => match child.wait() {
@@ -848,6 +840,61 @@ fn compile_in_child(container: &[u8]) -> CompileOutcome {
     };
     let _ = std::fs::remove_file(&file);
     outcome
+}
+
+/// Compiles `container`'s host pipeline in a child, bisecting a driver crash
+/// down to the one mnemonic whose disabling avoids it, then compiling with
+/// that mnemonic disabled. `Ok` means a host pipeline was made (possibly with
+/// a mnemonic disabled); the culprit is printed.
+#[cfg(windows)]
+fn isolated_compile(container: &[u8], mnemonics: &[&'static str]) -> Result<(), String> {
+    match compile_in_child_with(container, &[]) {
+        CompileOutcome::Made => Ok(()),
+        CompileOutcome::Refused(why) => Err(why),
+        CompileOutcome::Crashed => match find_crash_mnemonic(container, mnemonics) {
+            Some(culprit) => {
+                println!("pipeline fallback: disabled {culprit} (the driver crashes on it)");
+                Ok(())
+            }
+            None => Err(
+                "the driver crashed compiling the host pipeline, and no single mnemonic's disabling makes it"
+                    .into(),
+            ),
+        },
+    }
+}
+
+/// Finds the mnemonic whose disabling alone makes the driver compile the
+/// shader: each of `mnemonics` is tried alone in a child process, and the
+/// first that yields a made pipeline is the culprit. A true binary search
+/// does not work here: disabling a compare or another control-flow mnemonic
+/// removes the culprit's code path and so also stops the crash, but yields a
+/// refused (or wrongly simplified) pipeline, not a made one — so only "made"
+/// counts, and that must be asked of each mnemonic alone. `None` if no single
+/// mnemonic's disabling makes the pipeline.
+#[cfg(windows)]
+fn find_crash_mnemonic(container: &[u8], mnemonics: &[&'static str]) -> Option<&'static str> {
+    mnemonics
+        .iter()
+        .copied()
+        .find(|&m| matches!(compile_in_child_with(container, &[m]), CompileOutcome::Made))
+}
+
+/// The distinct VALU mnemonics of `program`, in first-use order: the set the
+/// driver-crash bisect disables one or several of.
+fn valu_mnemonics(program: &ir::Program) -> Vec<&'static str> {
+    let mut seen = HashSet::new();
+    program
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter(|i| {
+            matches!(i.fields, victory_shader::gfx10::Fields::Valu(_))
+                && !i.name().starts_with("v_interp_")
+        })
+        .map(|i| i.name())
+        .filter(|name| !name.is_empty() && seen.insert(*name))
+        .collect()
 }
 
 /// The child of `translate --pipelines` with `VICTORY_PIPELINE_ISOLATE=1`:
