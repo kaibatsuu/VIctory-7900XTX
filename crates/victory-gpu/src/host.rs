@@ -9127,6 +9127,7 @@ impl Meter {
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
+        crate::pipeline::set_loading_boost(draws < 500.0);
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // The lines (every second, and more every 5 s: sorting, system
         // calls, some forty lines written) are made by a thread of ours
@@ -9385,7 +9386,12 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let (w_done, w_total, w_waiting) = crate::pipeline::warming_progress();
+        let text = if w_waiting > 0 {
+            format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame | warming {w_done}/{w_total}")
+        } else {
+            format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame")
+        };
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,

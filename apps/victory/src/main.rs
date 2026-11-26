@@ -5,6 +5,8 @@
 
 mod census;
 mod inspect;
+#[cfg(windows)]
+mod launch_warm;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
 mod run;

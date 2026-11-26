@@ -154,6 +154,11 @@ pub(crate) fn translation() -> [u8; 32] {
     build()
 }
 
+/// Hex-encoded fingerprint of the active shader translation settings.
+pub fn translation_hex() -> String {
+    blake3::Hash::from_bytes(translation()).to_hex().to_string()
+}
+
 /// Puts the translation of `container` into the cache before any title asks
 /// for it (`victory shaders`): whether it was there already, or why it does
 /// not translate. The host is opened first, as a run does: what the card

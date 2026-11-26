@@ -27,7 +27,7 @@ const GLYPH: (u32, u32) = (5, 7);
 const CELL: (u32, u32) = (6, 9);
 /// Characters in a line, lines, and the box's rim in dots.
 const COLUMNS: u32 = 40;
-const LINES: u32 = 9;
+const LINES: u32 = 10;
 const RIM: u32 = 3;
 
 /// The texts are put into one of these in turn: the card reads the others,
@@ -212,6 +212,13 @@ fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec
     let (working, private) = crate::copystat::process_memory();
     let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
     let idle = (c[1] / 1e3).min(ms);
+    let (w_done, w_total, w_waiting) = crate::pipeline::warming_progress();
+    let pipeline_line = if w_waiting > 0 {
+        format!("WARMING {w_done}/{w_total}  LEFT {w_waiting}")
+    } else {
+        let (made, loaded) = crate::pipeline::library_counts();
+        format!("PIPELINES READY  MADE {made}  LOADED {loaded}")
+    };
     vec![
         format!("FPS {:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}", 1e3 / ms.max(0.001)),
         format!("DRAWS {:.0}  DROPPED {:.0}", c[10], c[8]),
@@ -221,6 +228,7 @@ fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec
         format!("MB UP {:.0}  TEXTURES {:.0}  BACK {:.0}", c[7] / 1e6, c[4] / 1e6, c[6] / 1e6),
         format!("RAM {:.1} GB  IN MEMORY {:.1}", gb(private), gb(working)),
         format!("VRAM {:.1}/{:.1} GB  SHARED {:.1}", gb(used), gb(budget), gb(shared)),
+        pipeline_line,
         format!("THIS PANEL {:.0} US A FRAME", cost),
     ]
 }

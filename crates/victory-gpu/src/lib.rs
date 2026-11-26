@@ -111,6 +111,12 @@ pub use cores::physical_cores;
 #[cfg(windows)]
 pub use host::on_failure;
 
+/// Hex-encoded fingerprint of the active shader translation settings.
+#[cfg(windows)]
+pub fn shader_cache_fingerprint() -> String {
+    shader_cache::translation_hex()
+}
+
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).
 #[cfg(all(windows, feature = "diagnostics"))]

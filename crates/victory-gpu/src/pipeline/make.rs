@@ -469,10 +469,56 @@ fn screens_first() -> bool {
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
+/// Pipelines queued in the current warming batch, and those completed so far.
+static WARM_TOTAL: AtomicU64 = AtomicU64::new(0);
+static WARM_DONE: AtomicU64 = AtomicU64::new(0);
+/// Whether the title appears to be in a menu or loading screen (<500 draws/frame).
+static LOADING_BOOST: AtomicBool = AtomicBool::new(true);
 
 /// Pipelines queued and not made yet (for the frame line).
 pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
+}
+
+/// Progress of the current warming batch: `(done, total, waiting)`.
+pub(crate) fn progress() -> (u64, u64, u64) {
+    progress_of(
+        WARM_DONE.load(Ordering::Relaxed),
+        WARM_TOTAL.load(Ordering::Relaxed),
+        WAITING.load(Ordering::Relaxed),
+    )
+}
+
+fn progress_of(done: u64, total: u64, waiting: u64) -> (u64, u64, u64) {
+    (done, total.max(done + waiting), waiting)
+}
+
+/// Whether pipeline workers may boost to normal priority while loading
+/// (`VICTORY_PIPELINE_BOOST`: on by default, `=0` disables).
+fn boost_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_BOOST").is_none_or(|v| v != "0"))
+}
+
+/// Updates whether the title is currently in menus or loading screens.
+pub(crate) fn set_loading_boost(loading: bool) {
+    LOADING_BOOST.store(loading, Ordering::Relaxed);
+}
+
+/// Desired Win32 thread priority for a pipeline worker.
+fn desired_priority(screens_only: bool, lowest_setting: bool, boost_active: bool) -> i32 {
+    use windows::Win32::System::Threading::{
+        THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL,
+    };
+    if screens_only {
+        THREAD_PRIORITY_BELOW_NORMAL.0
+    } else if boost_active {
+        THREAD_PRIORITY_NORMAL.0
+    } else if lowest_setting {
+        THREAD_PRIORITY_LOWEST.0
+    } else {
+        THREAD_PRIORITY_BELOW_NORMAL.0
+    }
 }
 
 /// The host pipeline if it is made (or is made within the frame's budget);
@@ -697,6 +743,7 @@ fn start(p: &Arc<Pending>, priority: u8) {
     if let Some(new) = queue.push(p, priority) {
         if new {
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+            WARM_TOTAL.fetch_add(1, Ordering::Relaxed);
         }
         // (One woken could be a worker that takes passes over the screen
         // alone: it would leave the pipeline to nobody.)
@@ -749,15 +796,28 @@ fn workers() -> bool {
                     // and the streaming one, which is below normal itself
                     // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
                     let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
-                        let _ = SetThreadPriority(GetCurrentThread(), priority);
-                    }
+                    let mut current_prio: Option<i32> = None;
+                    let apply_priority = |current: &mut Option<i32>| {
+                        let want = desired_priority(
+                            screens_only,
+                            lowest,
+                            boost_enabled() && LOADING_BOOST.load(Ordering::Relaxed),
+                        );
+                        if *current != Some(want) {
+                            // SAFETY: a plain call on our own thread.
+                            unsafe {
+                                use windows::Win32::System::Threading::*;
+                                let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY(want));
+                            }
+                            *current = Some(want);
+                        }
+                    };
+                    apply_priority(&mut current_prio);
                     loop {
                         let p = next(screens_only);
+                        apply_priority(&mut current_prio);
                         p.make();
+                        WARM_DONE.fetch_add(1, Ordering::Relaxed);
                         if p.was_slow.load(Ordering::Relaxed) {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
                             queue.slow_now -= 1;
@@ -787,6 +847,8 @@ static PEAK: AtomicU64 = AtomicU64::new(0);
 /// the cache saved (at most every 20 s).
 fn drained() {
     use super::library::{EARLY, LOADED, MADE};
+    WARM_TOTAL.store(0, Ordering::Relaxed);
+    WARM_DONE.store(0, Ordering::Relaxed);
     if PEAK.swap(0, Ordering::Relaxed) >= 10 {
         tracing::info!(
             made = MADE.load(Ordering::Relaxed),
@@ -802,6 +864,8 @@ fn drained() {
 mod tests {
     use super::*;
 
+    static TEST_WORKERS: Mutex<()> = Mutex::new(());
+
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
         assert_eq!(worker_count(None, 1), 2);
@@ -811,10 +875,27 @@ mod tests {
         assert_eq!(worker_count(Some(20), 24), 20);
     }
 
+    #[test]
+    fn desired_priority_follows_role_and_loading_boost() {
+        use windows::Win32::System::Threading::{
+            THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL,
+        };
+        // Screen workers stay below normal regardless of boost/lowest.
+        assert_eq!(desired_priority(true, false, false), THREAD_PRIORITY_BELOW_NORMAL.0);
+        assert_eq!(desired_priority(true, true, true), THREAD_PRIORITY_BELOW_NORMAL.0);
+        // Normal workers boost to normal while loading.
+        assert_eq!(desired_priority(false, true, true), THREAD_PRIORITY_NORMAL.0);
+        assert_eq!(desired_priority(false, false, true), THREAD_PRIORITY_NORMAL.0);
+        // In-world (boost inactive): drops to lowest or below normal.
+        assert_eq!(desired_priority(false, true, false), THREAD_PRIORITY_LOWEST.0);
+        assert_eq!(desired_priority(false, false, false), THREAD_PRIORITY_BELOW_NORMAL.0);
+    }
+
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
     #[test]
     fn first_use_is_made_by_a_worker() {
+        let _guard = TEST_WORKERS.lock().unwrap_or_else(|e| e.into_inner());
         let p = Arc::new(Pending::new(Vec::new(), None));
         assert!(ready(&p).is_none());
         assert_ne!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
@@ -823,6 +904,40 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn progress_reflects_queued_done_waiting_and_resets_on_drain() {
+        assert_eq!(progress_of(0, 0, 0), (0, 0, 0));
+        assert_eq!(progress_of(3, 10, 4), (3, 10, 4));
+        assert_eq!(progress_of(5, 2, 4), (5, 9, 4));
+
+        let _guard = TEST_WORKERS.lock().unwrap_or_else(|e| e.into_inner());
+        // Wait for any previously queued work from workers to finish draining.
+        let started = Instant::now();
+        while WAITING.load(Ordering::Relaxed) > 0 && started.elapsed() < Duration::from_secs(10) {
+            std::thread::yield_now();
+        }
+        assert_eq!(WAITING.load(Ordering::Relaxed), 0);
+
+        WARM_TOTAL.store(5, Ordering::Relaxed);
+        WARM_DONE.store(2, Ordering::Relaxed);
+        assert_eq!(progress(), (2, 5, 0));
+
+        drained();
+        assert_eq!(progress(), (0, 0, 0));
+
+        // Real worker round-trip increments WARM_TOTAL/WARM_DONE and drains back to 0.
+        let p = Arc::new(Pending::new(Vec::new(), None));
+        start(&p, REQUESTED);
+        let started = Instant::now();
+        while (p.made.get().is_none() || WAITING.load(Ordering::Relaxed) > 0)
+            && started.elapsed() < Duration::from_secs(10)
+        {
+            std::thread::yield_now();
+        }
+        assert!(p.made.get().is_some());
+        assert_eq!(progress(), (0, 0, 0));
     }
 
     #[test]

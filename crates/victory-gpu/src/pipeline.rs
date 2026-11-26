@@ -502,6 +502,26 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Progress of the current pipeline warming batch: `(done, total, waiting)`.
+#[cfg(windows)]
+pub(crate) fn warming_progress() -> (u64, u64, u64) {
+    make::progress()
+}
+
+/// Updates whether pipeline workers should boost during menus and loading screens.
+#[cfg(windows)]
+pub(crate) fn set_loading_boost(loading: bool) {
+    make::set_loading_boost(loading);
+}
+
+/// Host pipelines created and loaded from the library since the start.
+#[cfg(windows)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn library_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (library::MADE.load(Relaxed), library::LOADED.load(Relaxed))
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
