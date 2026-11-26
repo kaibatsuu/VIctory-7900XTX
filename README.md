@@ -46,6 +46,26 @@ as it was, with one correction (XCL, under its Credits).
   off; `VICTORY_MOUSE_FULL`, `VICTORY_MOUSE_SMOOTH_MS`,
   `VICTORY_MOUSE_DEADZONE` and `VICTORY_MOUSE_INVERT=1` tune it.
 
+## Ported from other forks (2026-11-26)
+
+Read on 2026-11-26: the source drop of codec-d/cool_fox build 30e54b4 (its base
+`f4b48ad`) and Op-lite/victory-scarlett `c45b43e` (`C:\Dev\oppi`). Six things
+were adapted here; what was read and left out, and why, is in
+[docs/ports-2026-11-26-cf-oppi.md](docs/ports-2026-11-26-cf-oppi.md).
+
+| Switch | Default | What it changes |
+|---|---|---|
+| `VICTORY_EARLY_DEPTH=0` | on | the console's `DEPTH_BEFORE_SHADER` (`[earlydepthstencil]`) declared to the host; off is the old late testing |
+| `VICTORY_E5_TARGETS=r11g11b10` | `r16g16b16a16` | R9G9B9E5 targets stand in as R11G11B10_FLOAT (no alpha, negatives stored as 0) instead of R16G16B16A16 |
+| `VICTORY_AMBIENT_LEFTOVER=hue` / `off` | `keep` | what the ambient stand-in does with the light the title's own resolve left (kept as before / its brightness only / dropped) |
+| `VICTORY_WINDOW_CARD_PERCENT=50..95` | `80` | the share of the card's budget up to which new windows outside buffers get a copy in card memory |
+| `VICTORY_STAGING_REST_MS`, `VICTORY_STAGING_PACK=1` | `2500`, off | how long a staging piece rests and whether pieces pack into the fullest block; both trims of staging memory |
+| `VICTORY_SEND_SPARE_MB=<n>` | `768` (`256` with `VICTORY_SEND_BAR`) | the most send-buffer memory kept spare |
+
+No run of this branch was made: the defaults are the picture every figure here
+was measured with, and each line in the table is an experiment with what to look
+at recorded in the doc.
+
 ## How to run it
 
 You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader model
