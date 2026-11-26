@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{HostShader, SpecConstant, SpecValue, StaticSampler, UserData};
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
 
@@ -267,6 +267,17 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    word(&mut out, s.spec_constants.len() as u32);
+    for spec in &s.spec_constants {
+        let (tag, bits) = match spec.default {
+            SpecValue::U32(v) => (0, v),
+            SpecValue::I32(v) => (1, v as u32),
+            SpecValue::F32(v) => (2, v.to_bits()),
+        };
+        for value in [spec.id, tag, bits, spec.offset_bits] {
+            word(&mut out, value);
+        }
+    }
     out
 }
 
@@ -335,6 +346,22 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    let n = r.word()? as usize;
+    let mut spec_constants = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        let id = r.word()?;
+        let default = match r.word()? {
+            0 => SpecValue::U32(r.word()?),
+            1 => SpecValue::I32(r.word()? as i32),
+            2 => SpecValue::F32(f32::from_bits(r.word()?)),
+            _ => return None,
+        };
+        spec_constants.push(SpecConstant {
+            id,
+            default,
+            offset_bits: r.word()?,
+        });
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -345,6 +372,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         root_indexed_views,
+        spec_constants,
     })
 }
 
@@ -379,6 +407,7 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
+            spec_constants: Vec::new(),
         }
     }
 

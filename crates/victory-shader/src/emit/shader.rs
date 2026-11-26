@@ -4,6 +4,7 @@
 
 use super::bitcode::{Attr, Md, Module, Ty, V};
 use super::container::{self, Binding, Psv, SigElement};
+use super::{SpecConstant, SpecValue};
 
 /// Where the shader reads its user data: `b0` in this space.
 pub const USER_DATA_SPACE: u32 = 0;
@@ -455,6 +456,19 @@ impl Shader {
         )
     }
 
+    /// A specialization constant the shader declares: an internal constant
+    /// global whose value [`super::HostShader::specialize`] patches. Returns
+    /// the global so a later lowering step can load it (parameterize a bone
+    /// count and the like).
+    pub fn spec_constant(&mut self, id: u32, value: SpecValue) -> V {
+        let (bits, float) = match value {
+            SpecValue::U32(v) => (v, false),
+            SpecValue::I32(v) => (v as u32, false),
+            SpecValue::F32(f) => (f.to_bits(), true),
+        };
+        self.m.spec_constant(id, bits, float)
+    }
+
     /// A descriptor heap handle, annotated with `props`; `nonuniform` when
     /// the index may differ between lanes (`NonUniformResourceIndex`).
     pub fn heap_handle(
@@ -521,8 +535,8 @@ impl Shader {
         self.annotate(block, h, props.0, props.1)
     }
 
-    /// The finished container.
-    pub fn finish(mut self) -> Vec<u8> {
+    /// The finished container and the specialization constants it declares.
+    pub fn finish(mut self) -> (Vec<u8>, Vec<SpecConstant>) {
         if self.pixel {
             // Reading a per-vertex value with attributeAtVertex needs a
             // constant input, even when the source declaration was smooth.
@@ -873,8 +887,20 @@ impl Shader {
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
-        let bitcode = self.m.write();
+        let (bitcode, specs) = self.m.write_with_specs();
         super::bitcode::census::note(&self.m, &bitcode);
+        let spec_constants: Vec<SpecConstant> = specs
+            .into_iter()
+            .map(|s| SpecConstant {
+                id: s.id,
+                default: if s.float {
+                    SpecValue::F32(f32::from_bits(s.value))
+                } else {
+                    SpecValue::U32(s.value)
+                },
+                offset_bits: s.offset,
+            })
+            .collect();
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
         dxil.extend((kind << 16 | 0x66).to_le_bytes());
         dxil.extend((((24 + bitcode.len()) / 4) as u32).to_le_bytes());
@@ -949,7 +975,7 @@ impl Shader {
             parts.push((b"PSG1", &psg1));
         }
         parts.extend([(b"PSV0", &psv0[..]), (b"HASH", &hash), (b"DXIL", &dxil)]);
-        container::build(&parts)
+        (container::build(&parts), spec_constants)
     }
 
     /// The user-data buffer's annotation carries its size, known only now.

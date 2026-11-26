@@ -12,6 +12,7 @@ use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
+use super::SpecConstant;
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
@@ -50,6 +51,9 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
+    /// Specialization constants the shader declares (none today: a later
+    /// step parameterizes near-duplicate programs with them).
+    pub spec_constants: Vec<SpecConstant>,
     /// Bit n: immediate sampler n is a comparison sampler.
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
@@ -2422,6 +2426,11 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        #[cfg(test)]
+        let nonuniform_handles = self.s.nonuniform_handles;
+        #[cfg(test)]
+        let wave_ops = self.s.flags & flags::WAVE_OPS != 0;
+        let (dxil, spec_constants) = self.s.finish();
         Ok(Lowered {
             wave_size,
             cmp_samplers,
@@ -2429,10 +2438,11 @@ impl<'a> Lower<'a> {
             root_srvs,
             root_uavs,
             #[cfg(test)]
-            nonuniform_handles: self.s.nonuniform_handles,
+            nonuniform_handles,
             #[cfg(test)]
-            wave_ops: self.s.flags & flags::WAVE_OPS != 0,
-            dxil: self.s.finish(),
+            wave_ops,
+            dxil,
+            spec_constants,
             user_data,
             samplers: self.samplers,
         })

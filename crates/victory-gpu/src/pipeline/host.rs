@@ -8,7 +8,7 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, SpecConstants, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -440,8 +440,13 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
 
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
-    /// state `g`, or for one compute shader.
-    pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+    /// state `g`, or for one compute shader. `spec_constants` are patched
+    /// into the compute shader's DXIL before the pipeline state is made.
+    pub(crate) fn new(
+        shaders: &[Arc<Shader>],
+        g: Option<&GraphicsState>,
+        spec_constants: &SpecConstants,
+    ) -> Option<HostPipeline> {
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
         super::library::label(format!("{shaders:?}"));
@@ -638,13 +643,32 @@ impl HostPipeline {
             )
         };
         if compute.is_some() {
+            // The compute shader's DXIL, with the pipeline's specialization
+            // constants patched in (the container re-signed by `specialize`).
+            let translated = stages[0].0.translated()?;
+            let specialized = (!spec_constants.is_empty()).then(|| {
+                translated.host.specialize(spec_constants).unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, ?shaders, "spec constants not applied");
+                    translated.host.dxil.clone()
+                })
+            });
+            let cs_code = match &specialized {
+                Some(dxil) => D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: dxil.as_ptr().cast(),
+                    BytecodeLength: dxil.len(),
+                },
+                None => D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: translated.host.dxil.as_ptr().cast(),
+                    BytecodeLength: translated.host.dxil.len(),
+                },
+            };
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 // SAFETY: a borrowed pointer the description never releases.
                 pRootSignature: unsafe { std::mem::transmute_copy(&root) },
-                CS: code(0),
+                CS: cs_code,
                 ..Default::default()
             };
-            let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
+            let name = super::library::name("compute", &root_blob, &[&code_bytes(&cs_code)], "");
             let made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.

@@ -30,6 +30,7 @@ use windows::core::PCSTR;
 
 use super::Shader;
 use super::host::{GraphicsState, HostPipeline};
+use victory_shader::emit::{SpecConstants, SpecValue};
 
 const SHADERS: &str = "known-shaders.bin";
 const PIPELINES: &str = "known-pipelines.bin";
@@ -241,16 +242,21 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
         each(*n, None);
         let began = std::time::Instant::now();
         let made = parse(entry, &mut read)
-            .and_then(|(shaders, g)| HostPipeline::new(&shaders, g.as_deref()))
+            .and_then(|(shaders, g)| HostPipeline::new(&shaders, g.as_deref(), &SpecConstants::new()))
             .is_some();
         each(*n, Some((began.elapsed().as_secs_f64() * 1e3, made)));
     }
 }
 
-/// Serialises one pipeline for [`make_pending`]: the shader containers and
-/// the graphics state. The run writes this to a file and has a child process
-/// make the pipeline, so a driver crash ends the child, not the run.
-pub(crate) fn pending(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> Vec<u8> {
+/// Serialises one pipeline for [`make_pending`]: the shader containers, the
+/// graphics state and the specialization constants. The run writes this to a
+/// file and has a child process make the pipeline, so a driver crash ends the
+/// child, not the run.
+pub(crate) fn pending(
+    shaders: &[Arc<Shader>],
+    graphics: Option<&GraphicsState>,
+    spec_constants: &SpecConstants,
+) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.push(shaders.len() as u8);
     for s in shaders {
@@ -258,6 +264,17 @@ pub(crate) fn pending(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>)
         bytes.push(stage);
         bytes.extend((s.container.len() as u32).to_le_bytes());
         bytes.extend(&s.container);
+    }
+    bytes.extend((spec_constants.len() as u32).to_le_bytes());
+    for (id, value) in spec_constants {
+        let (tag, bits): (u32, u32) = match value {
+            SpecValue::U32(v) => (0, *v),
+            SpecValue::I32(v) => (1, *v as u32),
+            SpecValue::F32(v) => (2, v.to_bits()),
+        };
+        bytes.extend(id.to_le_bytes());
+        bytes.extend(tag.to_le_bytes());
+        bytes.extend(bits.to_le_bytes());
     }
     bytes.push(u8::from(graphics.is_some()));
     if let Some(g) = graphics {
@@ -292,6 +309,10 @@ pub fn make_pending(bytes: &[u8]) -> bool {
         shaders.push(super::shader(stage, container));
         rest = &after[4 + len..];
     }
+    let (spec_constants, rest) = match read_spec_constants(rest) {
+        Some(read) => read,
+        None => return false,
+    };
     let Some((&has_graphics, after)) = rest.split_first() else {
         return false;
     };
@@ -303,7 +324,31 @@ pub fn make_pending(bytes: &[u8]) -> bool {
         };
         Some(Box::new(g))
     };
-    HostPipeline::new(&shaders, graphics.as_deref()).is_some()
+    HostPipeline::new(&shaders, graphics.as_deref(), &spec_constants).is_some()
+}
+
+/// Reads the specialization constants [`pending`] wrote and the bytes that
+/// follow them.
+fn read_spec_constants(mut bytes: &[u8]) -> Option<(SpecConstants, &[u8])> {
+    let (head, after) = bytes.split_first_chunk::<4>()?;
+    bytes = after;
+    let n = u32::from_le_bytes(*head) as usize;
+    let mut spec_constants = SpecConstants::new();
+    for _ in 0..n {
+        let (head, after) = bytes.split_first_chunk::<12>()?;
+        bytes = after;
+        let id = u32::from_le_bytes(head[0..4].try_into().ok()?);
+        let tag = u32::from_le_bytes(head[4..8].try_into().ok()?);
+        let bits = u32::from_le_bytes(head[8..12].try_into().ok()?);
+        let value = match tag {
+            0 => SpecValue::U32(bits),
+            1 => SpecValue::I32(bits as i32),
+            2 => SpecValue::F32(f32::from_bits(bits)),
+            _ => return None,
+        };
+        spec_constants.insert(id, value);
+    }
+    Some((spec_constants, bytes))
 }
 
 #[allow(clippy::type_complexity)]

@@ -238,7 +238,7 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         }
     }
     s.m.terminate(b, Term::Ret);
-    Ok(s.finish())
+    Ok(s.finish().0)
 }
 
 /// Column `col` of input `id` at vertex `vertex` of the triangle.
@@ -405,16 +405,20 @@ mod tests {
             }
             s.m.terminate(b, Term::Ret);
         }
-        let host = |stage, s: Shader| super::super::HostShader {
-            stage,
-            dxil: s.finish(),
-            user_data: Vec::new(),
-            samplers: Vec::new(),
-            static_samplers: Vec::new(),
-            root_cbvs: Vec::new(),
-            root_srvs: Vec::new(),
-            root_uavs: Vec::new(),
-            root_indexed_views: Vec::new(),
+        let host = |stage, s: Shader| {
+            let (dxil, spec_constants) = s.finish();
+            super::super::HostShader {
+                stage,
+                dxil,
+                user_data: Vec::new(),
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: Vec::new(),
+                root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
+                root_indexed_views: Vec::new(),
+                spec_constants,
+            }
         };
         (
             host(crate::native::HwStage::Vs, vs),

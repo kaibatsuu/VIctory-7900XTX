@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use super::Shader;
 use super::host::{GraphicsState, HostPipeline};
+use victory_shader::emit::SpecConstants;
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
@@ -43,6 +44,10 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
+    /// Specialization constants patched into the shader when the host
+    /// pipeline is made (a later step parameterizes near-duplicate shaders
+    /// with them; empty: the shader's defaults).
+    spec_constants: SpecConstants,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -68,6 +73,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            spec_constants: SpecConstants::new(),
         }
     }
 
@@ -75,13 +81,20 @@ impl Pending {
         &self.key
     }
 
+    /// The specialization constants to patch into the shader when the host
+    /// pipeline is made (empty by default).
+    pub(crate) fn with_spec_constants(mut self, spec_constants: SpecConstants) -> Pending {
+        self.spec_constants = spec_constants;
+        self
+    }
+
     fn make(&self) {
         self.made.get_or_init(|| {
             let began = Instant::now();
             let made = if isolate() {
-                isolated_make(&self.shaders, self.graphics.as_deref())
+                isolated_make(&self.shaders, self.graphics.as_deref(), &self.spec_constants)
             } else {
-                HostPipeline::new(&self.shaders, self.graphics.as_deref())
+                HostPipeline::new(&self.shaders, self.graphics.as_deref(), &self.spec_constants)
             };
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
@@ -104,15 +117,19 @@ fn isolate() -> bool {
 
 /// Makes the host pipeline through a child process ([`isolate`]); `None` if
 /// the child refused or died. A child that died costs this one pipeline.
-fn isolated_make(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> Option<HostPipeline> {
-    if !canary(&super::known::pending(shaders, graphics)) {
+fn isolated_make(
+    shaders: &[Arc<Shader>],
+    graphics: Option<&GraphicsState>,
+    spec_constants: &SpecConstants,
+) -> Option<HostPipeline> {
+    if !canary(&super::known::pending(shaders, graphics, spec_constants)) {
         tracing::warn!(
             ?shaders,
             "no host pipeline: the driver crashed compiling it (isolated in a child process)"
         );
         return None;
     }
-    HostPipeline::new(shaders, graphics)
+    HostPipeline::new(shaders, graphics, spec_constants)
 }
 
 /// Has a child process make the serialised pipeline; whether it was made (a
