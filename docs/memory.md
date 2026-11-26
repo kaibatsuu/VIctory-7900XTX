@@ -76,8 +76,7 @@ textures and buffers), which the driver cuts from the same 32 MB blocks.
 
 Why there are so many: with `VICTORY_THIN` a recording takes a list of ours from the pool
 (`thin.rs` `back_list`) and holds it until the title begins that list again or releases
-it, so there are about as many host lists as title lists. A list's prelude is made the
-first time the list needs one (`VICTORY_LAZY_PRELUDE`) and kept as long as the list,
+it, so there are about as many host lists as title lists. A list's prelude used to be made the first time the list needed one (the earlier lazy-prelude switch, since replaced by pooled preludes) and kept as long as the list,
 though it is recorded again at every submission (`HostList::prelude`) and has to live only
 while that submission is on the card.
 
