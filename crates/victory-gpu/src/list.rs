@@ -589,6 +589,8 @@ fn new_list(
 fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
     #[cfg(not(windows))]
     let _ = thin;
+    #[cfg(windows)]
+    crate::pipeline::prefetch(pipeline);
     let list = Box::new(List {
         object: match (crate::device::newer(), thin) {
             (true, false) => Object::new(&NEWER_LIST_FUNCTIONS),
@@ -621,8 +623,7 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
             let mut state = crate::draw::State::default();
             state.set_pipeline(pipeline);
             std::sync::Mutex::new(state)
-        },
-        #[cfg(windows)]
+        },        #[cfg(windows)]
         earlier: Vec::new(),
         #[cfg(windows)]
         gate: Vec::new(),
@@ -694,6 +695,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         state.reset(pipeline);
     });
     crate::pipeline::bound(pipeline);
+    crate::pipeline::prefetch(pipeline);
     #[cfg(not(windows))]
     let _ = this;
     S_OK
@@ -1547,6 +1549,7 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
 
 extern "system" fn set_pipeline(this: This, pipeline: This) {
     crate::pipeline::bound(pipeline);
+    crate::pipeline::prefetch(pipeline);
     #[cfg(windows)]
     with_state(this, |_, state| state.set_pipeline(pipeline));
     #[cfg(not(windows))]

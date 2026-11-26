@@ -213,6 +213,10 @@ fn journal_mut() -> std::sync::RwLockWriteGuard<'static, Journal> {
 #[cfg(feature = "diagnostics")]
 static WAITS: [[std::sync::atomic::AtomicU64; 2]; 4] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 4];
 
+/// Waits for [`GUARDS`] by caller: fault, guard, publish, write, other.
+#[cfg(feature = "diagnostics")]
+static GUARD_WAITS: [[std::sync::atomic::AtomicU64; 2]; 5] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 5];
+
 #[cfg(feature = "diagnostics")]
 fn waited<T>(what: usize, f: impl FnOnce() -> T) -> T {
     use std::sync::atomic::Ordering::Relaxed;
@@ -231,11 +235,28 @@ fn waited<T>(_: usize, f: impl FnOnce() -> T) -> T {
 /// [`WAITS`], taken, for the log: per frame.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn lock_waits(frames: f64) -> String {
+    use std::sync::atomic::Ordering::Relaxed;
     let of = |what: usize| {
-        let [n, ns] = [0, 1].map(|i| WAITS[what][i].swap(0, std::sync::atomic::Ordering::Relaxed));
+        let [n, ns] = [0, 1].map(|i| WAITS[what][i].swap(0, Relaxed));
         format!("{:.0} {:.2} ms", n as f64 / frames, ns as f64 / 1e6 / frames)
     };
-    format!("ranges held {}, journal read {}, journal noted in {}, guards {}", of(0), of(1), of(2), of(3))
+    let names = ["fault", "guard", "publish", "write", "other"];
+    let breakdown: Vec<String> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let [n, ns] = [0, 1].map(|j| GUARD_WAITS[i][j].swap(0, Relaxed));
+            format!("{name} {:.0} {:.2}", n as f64 / frames, ns as f64 / 1e6 / frames)
+        })
+        .collect();
+    format!(
+        "ranges held {}, journal read {}, journal noted in {}, guards {} ({})",
+        of(0),
+        of(1),
+        of(2),
+        of(3),
+        breakdown.join(", ")
+    )
 }
 
 /// The page ranges some thread is asking about: asking forgets what it
@@ -1220,7 +1241,7 @@ pub(crate) fn nothing_put(block: usize) -> bool {
 
 /// The title is about to write block by block around `at`: as by a fault.
 pub(crate) fn opened_for_writing(at: usize) {
-    let mut g = guards();
+    let mut g = guards_for(3);
     if open(&mut g, at, at + 1) != 0 {
         g.opened(at / BLOCK);
     }
@@ -1228,7 +1249,7 @@ pub(crate) fn opened_for_writing(at: usize) {
 
 /// An asking made blocks of `pages` clean and noted them in the journal.
 fn publish(pages: &[usize]) {
-    let g = guards();
+    let g = guards_for(2);
     for &page in pages {
         if g.clean.contains(page) || g.held.contains(page) {
             PUBLISHED.set(page);
@@ -1254,10 +1275,10 @@ fn known_holes() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_KNOWN_HOLES").is_none_or(|v| v != "0") && light())
 }
 
-/// Whether `block` lies in a placeholder: a reservation in which pages come
-/// to be only by mapping a view (or an allocation) in its place, which an
-/// ordinary commit cannot do.
-fn placeholder(block: usize) -> bool {
+/// If `block` lies in a placeholder reservation (in which pages come to be
+/// only by mapping a view or allocation in its place, which an ordinary commit
+/// cannot do), returns the end block of that placeholder region.
+fn placeholder_end(block: usize) -> Option<usize> {
     /// `MEMORY_REGION_INFORMATION` (ntddk).
     #[repr(C)]
     #[derive(Default)]
@@ -1296,7 +1317,14 @@ fn placeholder(block: usize) -> bool {
             std::ptr::null_mut(),
         )
     };
-    status >= 0 && region.region_type & PLACEHOLDER_RESERVATION != 0
+    (status >= 0 && region.region_type & PLACEHOLDER_RESERVATION != 0)
+        .then(|| region.allocation_base.saturating_add(region.region_size).div_ceil(BLOCK).max(block + 1))
+}
+
+/// Whether `block` lies in a placeholder.
+#[cfg(test)]
+fn placeholder(block: usize) -> bool {
+    placeholder_end(block).is_some()
 }
 
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
@@ -1389,11 +1417,11 @@ pub(crate) fn asks() -> [u64; 13] {
     std::array::from_fn(|i| ASKS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
-/// The guards' lock, the wait for it counted.
-fn guards_timed() -> std::sync::MutexGuard<'static, Guards> {
+/// The guards' lock, the wait for it counted under category `who`.
+fn guards_timed_for(who: usize) -> std::sync::MutexGuard<'static, Guards> {
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    let g = guards();
+    let g = guards_for(who);
     #[cfg(feature = "diagnostics")]
     tally(7, started.elapsed().as_nanos() as u64);
     g
@@ -1402,7 +1430,10 @@ fn guards_timed() -> std::sync::MutexGuard<'static, Guards> {
 /// A set of blocks, a bit each: a fault, or a look at a range of thousands of
 /// blocks, is a few words of it and no walk through a tree of every guarded
 /// block there is.
-struct Blocks(BTreeMap<usize, Box<[u64; Blocks::WORDS]>>);
+struct Blocks {
+    pieces: BTreeMap<usize, Box<[u64; Blocks::WORDS]>>,
+    len: usize,
+}
 
 impl Blocks {
     /// The words of 4 GiB.
@@ -1410,35 +1441,64 @@ impl Blocks {
     const IN_PIECE: usize = Blocks::WORDS * 64;
 
     const fn new() -> Blocks {
-        Blocks(BTreeMap::new())
+        Blocks {
+            pieces: BTreeMap::new(),
+            len: 0,
+        }
     }
 
     fn word(&self, word: usize) -> u64 {
-        self.0.get(&(word / Blocks::WORDS)).map_or(0, |piece| piece[word % Blocks::WORDS])
+        self.pieces.get(&(word / Blocks::WORDS)).map_or(0, |piece| piece[word % Blocks::WORDS])
     }
 
     fn contains(&self, block: usize) -> bool {
         self.word(block / 64) >> (block % 64) & 1 != 0
     }
 
+    /// Whether all blocks in `[first, last)` are present (false if `first >= last`).
+    fn all(&self, first: usize, last: usize) -> bool {
+        let mut block = first;
+        while block < last {
+            let word = block / 64;
+            let until = ((word + 1) * 64).min(last);
+            let mask = in_word(word * 64, block, until);
+            let Some(piece) = self.pieces.get(&(word / Blocks::WORDS)) else {
+                return false;
+            };
+            if piece[word % Blocks::WORDS] & mask != mask {
+                return false;
+            }
+            block = until;
+        }
+        first < last
+    }
+
     /// Whether it was not there.
     fn insert(&mut self, block: usize) -> bool {
-        let piece = self.0.entry(block / Blocks::IN_PIECE).or_insert_with(|| Box::new([0; Blocks::WORDS]));
+        let piece = self.pieces.entry(block / Blocks::IN_PIECE).or_insert_with(|| Box::new([0; Blocks::WORDS]));
         let word = &mut piece[block % Blocks::IN_PIECE / 64];
         let was = *word;
         *word |= 1 << (block % 64);
-        was != *word
+        let changed = was != *word;
+        if changed {
+            self.len += 1;
+        }
+        changed
     }
 
     /// Whether it was there.
     fn remove(&mut self, block: usize) -> bool {
-        let Some(piece) = self.0.get_mut(&(block / Blocks::IN_PIECE)) else {
+        let Some(piece) = self.pieces.get_mut(&(block / Blocks::IN_PIECE)) else {
             return false;
         };
         let word = &mut piece[block % Blocks::IN_PIECE / 64];
         let was = *word;
         *word &= !(1 << (block % 64));
-        was != *word
+        let changed = was != *word;
+        if changed {
+            self.len -= 1;
+        }
+        changed
     }
 
     fn insert_all(&mut self, blocks: std::ops::Range<usize>) {
@@ -1461,7 +1521,7 @@ impl Blocks {
             Bound::Unbounded => usize::MAX,
         }
         .max(first);
-        self.0.range(first / Blocks::IN_PIECE..=last / Blocks::IN_PIECE).flat_map(move |(&piece, words)| {
+        self.pieces.range(first / Blocks::IN_PIECE..=last / Blocks::IN_PIECE).flat_map(move |(&piece, words)| {
             let base = piece * Blocks::IN_PIECE;
             let from = first.max(base) - base;
             let to = last.min(base + Blocks::IN_PIECE).saturating_sub(base);
@@ -1474,7 +1534,7 @@ impl Blocks {
     }
 
     fn len(&self) -> usize {
-        self.0.values().flat_map(|piece| piece.iter()).map(|word| word.count_ones() as usize).sum()
+        self.len
     }
 }
 
@@ -1609,11 +1669,31 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     opened: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
 });
 
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
+fn guards_for(who: usize) -> std::sync::MutexGuard<'static, Guards> {
     if let Ok(g) = GUARDS.try_lock() {
         return g;
     }
-    waited(3, || GUARDS.lock().unwrap_or_else(|e| e.into_inner()))
+    #[cfg(feature = "diagnostics")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let began = std::time::Instant::now();
+        let g = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+        let ns = began.elapsed().as_nanos() as u64;
+        WAITS[3][0].fetch_add(1, Relaxed);
+        WAITS[3][1].fetch_add(ns, Relaxed);
+        GUARD_WAITS[who][0].fetch_add(1, Relaxed);
+        GUARD_WAITS[who][1].fetch_add(ns, Relaxed);
+        g
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        let _ = who;
+        GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+fn guards() -> std::sync::MutexGuard<'static, Guards> {
+    guards_for(4)
 }
 
 /// The 4 KiB pages of title memory that what shaders wrote was put into,
@@ -1827,53 +1907,68 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
-        && (PROTECTED.any(first, first + 1) || {
-            let g = guards_timed();
-            g.protected.contains(first) || g.absent.contains(first)
-        });
-    if !known && !is_view(start, end) {
-        return None;
-    }
-    install();
+    let ask_always = *ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"));
+    let mut g = if !ask_always && PROTECTED.any(first, first + 1) {
+        install();
+        guards_timed_for(1)
+    } else if !ask_always {
+        let g = guards_timed_for(1);
+        if g.protected.contains(first) || g.absent.contains(first) {
+            install();
+            g
+        } else {
+            drop(g);
+            if !is_view(start, end) {
+                return None;
+            }
+            install();
+            guards_timed_for(1)
+        }
+    } else {
+        if !is_view(start, end) {
+            return None;
+        }
+        install();
+        guards_timed_for(1)
+    };
     // The holes that an ordinary commit may have filled, with no word of the
     // runtime's. Windows is asked with the lock not held (the range is, no
     // other thread asks about it: `ASKING`); what the runtime tells meanwhile
     // takes the block out of the set, and it is looked at as any other.
-    let unsure: Vec<usize> = {
-        let g = guards_timed();
-        if g.clean.range(first..last).count() == last - first && !BESIDE.any(first, last) {
-            // Nothing written, mapped or new since the range was last taken.
-            #[cfg(feature = "diagnostics")]
-            tally(3, 1);
-            return Some(Vec::new());
+    if g.clean.all(first, last) && !BESIDE.any(first, last) {
+        // Nothing written, mapped or new since the range was last taken.
+        #[cfg(feature = "diagnostics")]
+        tally(3, 1);
+        return Some(Vec::new());
+    }
+    let unsure: Vec<usize> = g.absent.range(first..last).filter(|block| !g.held.contains(*block)).collect();
+    if !unsure.is_empty() {
+        drop(g);
+        let mut came: Vec<(usize, bool)> = Vec::new();
+        let mut uncommitted_until = first;
+        for block in unsure {
+            // One question for the blocks of a region.
+            if block >= uncommitted_until {
+                uncommitted_until = uncommitted_end(block);
+                #[cfg(feature = "diagnostics")]
+                tally(9, 1);
+            }
+            if block >= uncommitted_until {
+                // The hole may have been given up, and its address be the
+                // title's heap's, or code's, now: not ours to guard.
+                came.push((block, is_view(block * BLOCK, (block + 1) * BLOCK)));
+            }
         }
-        g.absent.range(first..last).filter(|block| !g.held.contains(*block)).collect()
-    };
-    let mut came: Vec<(usize, bool)> = Vec::new();
-    let mut uncommitted_until = first;
-    for block in unsure {
-        // One question for the blocks of a region.
-        if block >= uncommitted_until {
-            uncommitted_until = uncommitted_end(block);
-            #[cfg(feature = "diagnostics")]
-            tally(9, 1);
-        }
-        if block >= uncommitted_until {
-            // The hole may have been given up, and its address be the
-            // title's heap's, or code's, now: not ours to guard.
-            came.push((block, is_view(block * BLOCK, (block + 1) * BLOCK)));
+        g = guards_timed_for(1);
+        for &(block, view) in &came {
+            if g.absent.remove(block) && !view {
+                g.foreign.insert(block);
+            }
         }
     }
     let rest = rest();
-    let mut g = guards_timed();
     #[cfg(feature = "diagnostics")]
     tally(4, 1);
-    for &(block, view) in &came {
-        if g.absent.remove(block) && !view {
-            g.foreign.insert(block);
-        }
-    }
     // The range's blocks that are neither clean nor known to be holes. A
     // frame asks about some 10 GB of view memory, 150,000 blocks, nearly all
     // clean.
@@ -1882,17 +1977,20 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         let known = g.clean.word(word) & !BESIDE.word(word) | g.absent.word(word);
         written.extend(BitsOf(!known & in_word(word * 64, first, last)).map(|bit| word * 64 + bit));
     }
+    const MAX_PROTECT_RUN: usize = 16;
     let mut run: Option<(usize, usize)> = None;
+    let mut covered = 0usize;
     for &block in &written {
         if let Some((from, to)) = run
-            && to != block
+            && (to != block || to - from >= MAX_PROTECT_RUN)
         {
             protect(&mut g, from, to);
             run = None;
-            // Faults of the title's wait for the lock: each block is done on
-            // its own, and looked at anew below.
+            covered = 0;
+            // Faults of the title's wait for the lock: each bounded run is done
+            // on its own, and looked at anew below.
             drop(g);
-            g = guards_timed();
+            g = guards_timed_for(1);
         }
         // Told as written by this, and read by the caller after.
         if BESIDE.take(block) {
@@ -1910,6 +2008,12 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             }
             if cover(&mut g, block, block + 1) {
                 g.clean.insert(block);
+            }
+            covered += 1;
+            if covered >= MAX_PROTECT_RUN {
+                covered = 0;
+                drop(g);
+                g = guards_timed_for(1);
             }
         } else if !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest) {
             run = Some((run.map_or(block, |r| r.0), block + 1));
@@ -2109,6 +2213,9 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         return;
     }
     let mut uncommitted_until = from;
+    let mut held_until = from;
+    let mut held_checked_until = from;
+    let holes = known_holes();
     for block in from..to {
         // (Not one question a block of a region that is not there.)
         if block >= uncommitted_until && set(block, block + 1) {
@@ -2122,8 +2229,17 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
             tally(9, 1);
         }
         if block < uncommitted_until {
+            if holes && block >= held_checked_until {
+                if let Some(end) = placeholder_end(block) {
+                    held_until = end.min(uncommitted_until);
+                    held_checked_until = held_until;
+                } else {
+                    held_until = block;
+                    held_checked_until = uncommitted_until;
+                }
+            }
             g.absent.insert(block);
-            if known_holes() && placeholder(block) {
+            if holes && block < held_until {
                 g.held.insert(block);
             }
         }
@@ -2156,6 +2272,17 @@ fn open(g: &mut Guards, start: usize, end: usize) -> usize {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     if first >= last {
         return 0;
+    }
+    if first + 1 == last {
+        let protected = g.protected.contains(first);
+        let aliased = g.aliased.contains(first);
+        if !protected && !aliased {
+            return 0;
+        }
+        if protected && !aliased {
+            unguard(g, &[first]);
+            return 1;
+        }
     }
     let mut blocks: Vec<usize> = g.protected.range(first..last).collect();
     let here = blocks.len();
@@ -2225,7 +2352,7 @@ pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
     let last = at.saturating_add(len).div_ceil(BLOCK);
     if !light() || PROTECTED.any(at / BLOCK, last) {
-        let mut g = guards_timed();
+        let mut g = guards_timed_for(3);
         let opened = open(&mut g, at, at.saturating_add(len));
         #[cfg(feature = "diagnostics")]
         {
@@ -2251,7 +2378,7 @@ pub struct KernelWrite(usize, usize);
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     {
-        let mut g = guards_timed();
+        let mut g = guards_timed_for(3);
         open(&mut g, at, at.saturating_add(len));
         if len != 0 {
             // Nothing known of them stands while they are left alone.
@@ -2274,7 +2401,7 @@ impl Drop for KernelWrite {
         if self.0 == self.1 {
             return;
         }
-        let mut g = guards();
+        let mut g = guards_for(3);
         if let Some(i) = g.kernel.iter().position(|&r| r == (self.0, self.1)) {
             g.kernel.swap_remove(i);
         }
@@ -2343,8 +2470,8 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
             return;
         }
     }
-    {
-        let mut g = guards();
+    if !light() || PROTECTED.any(at / BLOCK, end.div_ceil(BLOCK)) {
+        let mut g = guards_for(3);
         let guarded = g.protected.range(at / BLOCK..end.div_ceil(BLOCK)).count() as u64;
         if pages {
             WRITTEN[2].fetch_add(guarded, Relaxed);
@@ -2531,7 +2658,7 @@ fn came_back(at: usize, write: bool) -> bool {
             return readable_view(at);
         }
         // (A refresh may have guarded the page that came back.)
-        open(&mut guards(), at, at + 1) != 0 || writable(at)
+        open(&mut guards_for(0), at, at + 1) != 0 || writable(at)
     };
     let before = changes();
     if there() || again_after_change(before, there) {
@@ -2738,6 +2865,13 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static,
     g
 }
 
+static LAZY_COMMIT: std::sync::OnceLock<fn(usize) -> bool> = std::sync::OnceLock::new();
+
+pub(crate) fn set_lazy_commit_hook(f: fn(usize) -> bool) {
+    let _ = LAZY_COMMIT.set(f);
+    install();
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 pub(crate) fn install() {
@@ -2784,6 +2918,12 @@ pub(crate) fn install() {
                 {
                     EXCEPTION_CONTINUE_EXECUTION
                 }
+                None if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+                    && r.NumberParameters >= 2
+                    && LAZY_COMMIT.get().is_some_and(|f| f(r.ExceptionInformation[1])) =>
+                {
+                    EXCEPTION_CONTINUE_EXECUTION
+                }
                 None => EXCEPTION_CONTINUE_SEARCH,
             };
         }
@@ -2810,7 +2950,7 @@ pub(crate) fn install() {
             let began = std::time::Instant::now();
             // (Let go again before the next look: the runtime wants the
             // guards to end a change.)
-            let mut g = guards();
+            let mut g = guards_for(0);
             #[cfg(feature = "diagnostics")]
             let waited = began.elapsed();
             let opened = open(&mut g, at, at + 1);
@@ -2836,6 +2976,7 @@ pub(crate) fn install() {
         match ours {
             Some(exit) => fail(exit),
             None if came_back(at, true) => EXCEPTION_CONTINUE_EXECUTION,
+            None if LAZY_COMMIT.get().is_some_and(|f| f(at)) => EXCEPTION_CONTINUE_EXECUTION,
             None => EXCEPTION_CONTINUE_SEARCH,
         }
     }
@@ -4009,9 +4150,31 @@ mod tests {
                 assert!(set.range(a..).eq(other.range(a..).copied()) && set.range(..).eq(other.iter().copied()));
                 assert!(set.range(a..=b).eq(other.range(a..=b).copied()));
                 assert_eq!(set.len(), other.len());
+                assert_eq!(set.all(a, b), a < b && (a..b).all(|x| other.contains(&x)), "all {a}..{b}");
             }
         }
         assert_eq!(set.range(5..usize::MAX).next(), other.range(5..).next().copied());
+        // `all` across word, multi-word, and piece boundaries, empty ranges, and holes.
+        let mut dense = Blocks::new();
+        assert!(!dense.all(0, 0));
+        assert!(!dense.all(10, 5));
+        let start = Blocks::IN_PIECE - 70;
+        let end = Blocks::IN_PIECE + 140;
+        dense.insert_all(start..end);
+        assert_eq!(dense.len(), end - start);
+        assert!(dense.all(start, end));
+        assert!(dense.all(start + 1, start + 65));
+        assert!(dense.all(Blocks::IN_PIECE - 1, Blocks::IN_PIECE + 1));
+        assert!(!dense.all(start - 1, end));
+        assert!(!dense.all(start, end + 1));
+        dense.remove(Blocks::IN_PIECE);
+        assert_eq!(dense.len(), end - start - 1);
+        assert!(!dense.all(start, end));
+        assert!(dense.all(start, Blocks::IN_PIECE));
+        assert!(dense.all(Blocks::IN_PIECE + 1, end));
+        assert!(!dense.remove(Blocks::IN_PIECE));
+        assert!(!dense.insert(start));
+        assert_eq!(dense.len(), end - start - 1);
     }
 
     /// What is known of a block by its bit is so at every view of its page:

@@ -24,6 +24,7 @@ pub mod kernel;
 pub mod lifecycle;
 #[cfg(windows)]
 pub mod media;
+pub mod mouse;
 #[cfg(windows)]
 pub mod net;
 pub mod rpcrt4;

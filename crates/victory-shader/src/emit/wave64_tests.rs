@@ -142,7 +142,6 @@ fn lowered_counted(
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
-        spec_constants: lowered.spec_constants,
     })
 }
 
@@ -282,7 +281,6 @@ fn on_64_lanes(native: &NativeProgram, p: &ir::Program) -> HostShader {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
-        spec_constants: lowered.spec_constants,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -1206,7 +1204,6 @@ fn partial_dispatch_with_a_cross_half_wave_op_runs_in_32_lane_waves() {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
-        spec_constants: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).unwrap_or_else(|e| panic!("DXIL validation: {e}"));

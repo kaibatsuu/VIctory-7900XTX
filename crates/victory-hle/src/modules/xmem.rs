@@ -11,7 +11,7 @@ use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
@@ -398,6 +398,11 @@ struct Section {
     window: std::sync::OnceLock<usize>,
     /// A bit per page: committed, as far as [`Section::window`] asked.
     committed: Box<[std::sync::atomic::AtomicU64]>,
+    /// (`VICTORY_POOL_DISCARD`) A bit per page: written through
+    /// [`Section::window`] and not discarded since (resident in our view).
+    resident: Box<[std::sync::atomic::AtomicU64]>,
+    /// (`VICTORY_POOL_DISCARD`) A bit per page: discarded and not written since.
+    discarded: Box<[std::sync::atomic::AtomicU64]>,
 }
 
 impl Section {
@@ -445,6 +450,7 @@ impl Section {
             }
             page += run;
         }
+        pool_discard::written(self, index, n);
         Some(base + index * PAGE)
     }
 }
@@ -637,6 +643,171 @@ fn page_table_mut() -> RwLockWriteGuard<'static, Pages> {
     PAGES.write().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Live physical-page sections tracked weakly for unique-page memory stats.
+static SECTIONS: Mutex<Vec<Weak<Section>>> = Mutex::new(Vec::new());
+
+/// Whole-section pool views whose commit was deferred (`VICTORY_LAZY_POOL_COMMIT=1`):
+/// `(base, len, weak section)`.
+static LAZY_POOLS: RwLock<Vec<(usize, usize, Weak<Section>)>> = RwLock::new(Vec::new());
+
+/// Number of pages committed on demand by [`lazy_pool_commit_fault`].
+static LAZY_POOL_FAULTS: AtomicU64 = AtomicU64::new(0);
+
+/// `VICTORY_LAZY_POOL_COMMIT=1` (off by default): defer committing whole-section
+/// pool views (`>= 1 GiB`) until pages are mapped into active views, written
+/// through `Section::window`, or touched directly (via narrow VEH fallback).
+/// Disabled under Wine, which already uses `SEC_COMMIT`.
+fn lazy_pool_commit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !on_wine() && std::env::var("VICTORY_LAZY_POOL_COMMIT").is_ok_and(|v| v.trim() == "1")
+    })
+}
+
+fn is_whole_pool_view(len: usize, slice: &Slice) -> bool {
+    !on_wine() && len >= (1 << 30) && slice.index == 0 && len == slice.section.pages * PAGE
+}
+
+/// Narrow VEH fallback for `VICTORY_LAZY_POOL_COMMIT=1`: commits a single
+/// 64 KiB page if `at` falls within a deferred whole-section pool view.
+/// Acquires ONLY `LAZY_POOLS.read()` to guarantee zero deadlock in VEH.
+fn lazy_pool_commit_fault(at: usize) -> bool {
+    let found = {
+        let pools = LAZY_POOLS.read().unwrap_or_else(|e| e.into_inner());
+        pools
+            .iter()
+            .find(|&&(p_base, p_len, _)| at >= p_base && at < p_base.saturating_add(p_len))
+            .and_then(|(p_base, _, sec)| Some((*p_base, sec.upgrade()?)))
+    };
+    let Some((p_base, section)) = found else {
+        return false;
+    };
+    let page_addr = at & !(PAGE - 1);
+    let page_index = (page_addr - p_base) / PAGE;
+    if section.commit_shown(page_index, page_addr, PAGE) {
+        if LAZY_POOL_FAULTS.fetch_add(1, Ordering::Relaxed) == 0 {
+            tracing::warn!(
+                at = format_args!("{at:#x}"),
+                page_index,
+                "VICTORY_LAZY_POOL_COMMIT=1: direct access to deferred pool-view page; committing on demand"
+            );
+        }
+        true
+    } else {
+        false
+    }
+}
+
+pub struct MemoryStats {
+    pub unique_allocated_bytes: u64,
+    pub unique_committed_bytes: u64,
+    pub window_mapped_bytes: u64,
+    pub active_unique_pages: u64,
+    pub pool_only_pages: u64,
+    pub active_views_va_bytes: u64,
+    pub pool_views_va_bytes: u64,
+    pub lazy_pool_faults: u64,
+}
+
+pub fn memory_stats() -> MemoryStats {
+    let live_sections: Vec<Arc<Section>> = {
+        let mut sections = SECTIONS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut live = Vec::with_capacity(sections.len());
+        sections.retain(|w| {
+            if let Some(s) = w.upgrade() {
+                live.push(s);
+                true
+            } else {
+                false
+            }
+        });
+        live
+    };
+    let mut unique_allocated_bytes = 0u64;
+    let mut unique_committed_bytes = 0u64;
+    let mut window_mapped_bytes = 0u64;
+    for s in &live_sections {
+        let bytes = (s.pages * PAGE) as u64;
+        unique_allocated_bytes += bytes;
+        let committed_pages: u64 = s.committed.iter().map(|w| w.load(Ordering::Relaxed).count_ones() as u64).sum();
+        unique_committed_bytes += committed_pages * PAGE as u64;
+        if s.window.get().is_some_and(|&b| b != 0) {
+            window_mapped_bytes += bytes;
+        }
+    }
+    let mut pool_views_va_bytes = 0u64;
+    let mut active_views_va_bytes = 0u64;
+    let view_entries: Vec<(usize, usize, usize, usize, bool)> = {
+        let phys = physical();
+        let mut entries = Vec::with_capacity(phys.views.len());
+        for (len, slice) in phys.views.values() {
+            let is_pool = *len >= (1 << 30) && slice.index == 0 && *len == slice.section.pages * PAGE;
+            if is_pool {
+                pool_views_va_bytes += *len as u64;
+            } else {
+                active_views_va_bytes += *len as u64;
+            }
+            entries.push((
+                Arc::as_ptr(&slice.section) as usize,
+                slice.section.pages,
+                slice.index,
+                *len / PAGE,
+                is_pool,
+            ));
+        }
+        entries
+    };
+    let mut per_section: HashMap<usize, (usize, Vec<u64>, bool)> = HashMap::new();
+    for (sec_ptr, sec_pages, index, count, is_pool) in view_entries {
+        let entry = per_section
+            .entry(sec_ptr)
+            .or_insert_with(|| (sec_pages, vec![0u64; sec_pages.div_ceil(64)], false));
+        if is_pool {
+            entry.2 = true;
+        } else {
+            let end = (index + count).min(sec_pages);
+            for p in index..end {
+                entry.1[p / 64] |= 1u64 << (p % 64);
+            }
+        }
+    }
+    let mut active_unique_pages = 0u64;
+    let mut pool_only_pages = 0u64;
+    for (sec_pages, active_bits, has_pool) in per_section.into_values() {
+        let active: u64 = active_bits.iter().map(|w| w.count_ones() as u64).sum();
+        active_unique_pages += active;
+        if has_pool {
+            pool_only_pages += (sec_pages as u64).saturating_sub(active);
+        }
+    }
+    MemoryStats {
+        unique_allocated_bytes,
+        unique_committed_bytes,
+        window_mapped_bytes,
+        active_unique_pages,
+        pool_only_pages,
+        active_views_va_bytes,
+        pool_views_va_bytes,
+        lazy_pool_faults: LAZY_POOL_FAULTS.load(Ordering::Relaxed),
+    }
+}
+
+pub fn memory_stats_line() -> String {
+    let s = memory_stats();
+    let total_va_bytes = s.active_views_va_bytes + s.pool_views_va_bytes;
+    format!(
+        "xmem unique: allocated {} MB, committed {} MB, Section::window {} MB, active unique {} MB, pool-only (free-list) {} MB; aliased VA views {} MB (pool views {} MB); lazy pool faults {}",
+        s.unique_allocated_bytes >> 20,
+        s.unique_committed_bytes >> 20,
+        s.window_mapped_bytes >> 20,
+        (s.active_unique_pages * PAGE as u64) >> 20,
+        (s.pool_only_pages * PAGE as u64) >> 20,
+        total_va_bytes >> 20,
+        s.pool_views_va_bytes >> 20,
+        s.lazy_pool_faults,
+    )
+}
+
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
 pub extern "system" fn XMemAllocatePhysicalPages(
     flags: u64,
@@ -689,7 +860,14 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         pages: n,
         window: std::sync::OnceLock::new(),
         committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+        resident: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+        discarded: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
     });
+    static REGISTERED_XMEM_STATS: std::sync::Once = std::sync::Once::new();
+    REGISTERED_XMEM_STATS.call_once(|| {
+        victory_gpu::set_xmem_stats(memory_stats_line);
+    });
+    SECTIONS.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&section));
     let mut table = page_table_mut();
     let first = table.next_page;
     table.next_page += n * FRAMES;
@@ -760,6 +938,9 @@ impl View {
         if !commit(at.Value as usize, len) {
             tracing::warn!(error = %std::io::Error::last_os_error(), n, "physical pages not committed for a write");
             return None;
+        }
+        for p in slice.index..(slice.index + n).min(slice.section.pages) {
+            slice.section.committed[p / 64].fetch_or(1 << (p % 64), Ordering::AcqRel);
         }
         Some(view)
     }
@@ -1499,11 +1680,13 @@ struct Op {
     had: bool,
     /// The placeholder is the page's own (or will be, after the unmapping).
     own: bool,
+    /// (`VICTORY_POOL_DISCARD`) What the view taken away showed.
+    old: Option<Slice>,
 }
 
 impl Op {
     fn new(at: usize, slice: Option<Slice>) -> Op {
-        Op { at, slice, had: false, own: false }
+        Op { at, slice, had: false, own: false, old: None }
     }
 
     /// The system calls; whether the host did as asked.
@@ -1544,6 +1727,9 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
             Some((base, PAGE)) if base == op.at => {
                 if let Some((size, slice)) = physical.views.remove(&op.at) {
                     shown_mut().forget(op.at, size, &slice);
+                    if pool_discard::on() {
+                        op.old = Some(slice);
+                    }
                 }
                 victory_gpu::title_memory_unmapping(op.at, PAGE);
                 physical.holes.remove(&op.at);
@@ -1570,6 +1756,14 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
     let done = pool::all(ops);
     let mut ok = true;
     for (op, done) in done {
+        // (`VICTORY_POOL_DISCARD`) The page's old view is really gone,
+        // looked at before what is there now is noted.
+        if op.had
+            && done
+            && let Some(old) = &op.old
+        {
+            pool_discard::unshown(physical, old);
+        }
         match op.slice {
             Some(slice) if done => {
                 // As in `map`.
@@ -1700,7 +1894,7 @@ mod pool {
             .ops
             .iter()
             .map(|(op, done)| {
-                let op = Op { at: op.at, slice: op.slice.clone(), had: op.had, own: op.own };
+                let op = Op { at: op.at, slice: op.slice.clone(), had: op.had, own: op.own, old: op.old.clone() };
                 (op, done.load(Ordering::Acquire))
             })
             .collect()
@@ -1771,6 +1965,22 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
             "mapping physical pages failed (not a placeholder?)"
         );
         return false;
+    }
+    if lazy_pool_commit() && is_whole_pool_view(len, slice) {
+        static LAZY_HOOK: std::sync::Once = std::sync::Once::new();
+        LAZY_HOOK.call_once(|| {
+            victory_gpu::set_lazy_commit_hook(lazy_pool_commit_fault);
+        });
+        LAZY_POOLS
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((base, len, Arc::downgrade(&slice.section)));
+        tracing::info!(
+            base = format_args!("{base:#x}"),
+            mb = len >> 20,
+            "VICTORY_LAZY_POOL_COMMIT=1: deferred commit on whole-section pool view"
+        );
+        return true;
     }
     if !slice.section.commit_shown(slice.index, base, len) {
         // SAFETY: the view just mapped, back to a placeholder.
@@ -1850,6 +2060,10 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         return;
     }
     let end = base + len;
+    if lazy_pool_commit() {
+        let mut pools = LAZY_POOLS.write().unwrap_or_else(|e| e.into_inner());
+        pools.retain(|(p_base, p_len, _)| *p_base >= end || p_base.saturating_add(*p_len) <= base);
+    }
     // Views do not overlap: the one holding `base`, then those starting
     // inside (the GPU's page mappings make one view per page).
     let first = physical
@@ -1862,6 +2076,9 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         .into_iter()
         .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
         .collect();
+    // (`VICTORY_POOL_DISCARD`) The pages that lost a view, looked at once
+    // the views are as they stay.
+    let mut lost: Vec<Slice> = Vec::new();
     for at in hit {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
@@ -1885,12 +2102,320 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         if gone != 0 && at >= base && at + size <= end {
             physical.holes.insert(at, size);
         }
+        // (`VICTORY_POOL_DISCARD`) What of the view lies inside the range is
+        // really gone (the rest is mapped again below).
+        if gone != 0 && pool_discard::on() {
+            let (lo, hi) = (at.max(base), (at + size).min(end));
+            lost.extend(
+                (lo..hi)
+                    .step_by(PAGE)
+                    .map(|a| Slice { index: slice.index + (a - at) / PAGE, section: slice.section.clone() }),
+            );
+        }
         if at < base {
             map(physical, at, base - at, slice.clone());
         }
         if at + size > end {
             let index = slice.index + (end - at) / PAGE;
             map(physical, end, at + size - end, Slice { index, ..slice });
+        }
+    }
+    for page in &lost {
+        pool_discard::unshown(physical, page);
+    }
+}
+
+/// `VICTORY_POOL_DISCARD=1` (off by default; ported from Op-lite/victory-scarlett
+/// 411a745, where run-118's best set had it on: "halves the cost of the
+/// game's page-mapping calls and the number of freezes"). Needs the
+/// section's lasting view, `VICTORY_SECTION_WINDOW` (on unless `=0`). The
+/// lasting view keeps every page DirectStorage ever wrote through it in this
+/// process's working set, also after the title has given the page back
+/// (their run-49: 24.7 GB working set against 19.1). The title's streaming
+/// pool is one allocation it shows whole at one address for good (its pool
+/// view) and maps page by page into its CPU and GPU streaming views from a
+/// free list; a page shown by no view but a whole-section one is on that
+/// free list and its bytes are dead. Such a page, still so
+/// `pool_discard::delay` after it was last unmapped and while free RAM is
+/// under `VICTORY_POOL_DISCARD_BELOW_MB` (4096; 0: always), is reset in the
+/// lasting view (`MEM_RESET`) and taken out of the working set
+/// (`VirtualUnlock`), under the views' lock, so no map of it can come
+/// between the check and the reset. Pages of sections without a whole view
+/// are never touched. `VICTORY_POOL_DISCARD_DELAY_S`: 0 (default) adaptive
+/// 2-10 s, N fixed. Line every 30 s: "pool discard: ...".
+///
+/// (Here, beyond the port: pages wait to be looked at again by a weak hold
+/// on their section, so a section the title frees goes while its pages are
+/// still noted, as with RAM plentiful they stay noted for long.)
+mod pool_discard {
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
+    use std::time::{Duration, Instant};
+
+    use super::{PAGE, Physical, Section, Slice};
+
+    pub(super) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            let window = std::env::var_os("VICTORY_SECTION_WINDOW").is_none_or(|v| v != "0");
+            let on = window && std::env::var_os("VICTORY_POOL_DISCARD").is_some_and(|v| v == "1");
+            tracing::info!(on, "VICTORY_POOL_DISCARD: pool pages the title has given back (shown by no view but its whole pool view) are reset and taken out of the working set in the section's lasting view while free RAM is short");
+            on
+        })
+    }
+
+    /// Pages resident through the lasting views, discarded since the
+    /// start, resets refused, rewritten within 5 s of their discard.
+    static COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    const RESIDENT: usize = 0;
+    const DISCARDED: usize = 1;
+    const FAILED: usize = 2;
+    const REWRITTEN: usize = 3;
+
+    /// Pages that lost a view, to look at again later: when, and the page
+    /// (its section held weakly).
+    static UNSHOWN: Mutex<VecDeque<(Instant, Weak<Section>, usize)>> = Mutex::new(VecDeque::new());
+    /// The most pages kept noted.
+    const UNSHOWN_MOST: usize = 1 << 18;
+    /// When each page was discarded, until written again (or 5 s on).
+    static DISCARDED_AT: LazyLock<Mutex<HashMap<(usize, usize), Instant>>> = LazyLock::new(Default::default);
+    /// Discards in the adaptive window, and of them rewritten within 5 s.
+    static WINDOW: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    static HELD_BY_RAM: AtomicBool = AtomicBool::new(false);
+    static DELAY_MS: AtomicU64 = AtomicU64::new(2000);
+
+    fn key(section: &Section, index: usize) -> (usize, usize) {
+        (std::ptr::from_ref(section) as usize, index)
+    }
+
+    /// Pages `[index, index + n)` of `section` were written through its
+    /// lasting view: resident there from now on.
+    pub(super) fn written(section: &Section, index: usize, n: usize) {
+        if !on() {
+            return;
+        }
+        for k in index..(index + n).min(section.pages) {
+            let bit = 1u64 << (k % 64);
+            if section.resident[k / 64].fetch_or(bit, Relaxed) & bit == 0 {
+                COUNTS[RESIDENT].fetch_add(1, Relaxed);
+            }
+            if section.discarded[k / 64].fetch_and(!bit, Relaxed) & bit != 0 {
+                let at = DISCARDED_AT.lock().unwrap_or_else(|e| e.into_inner()).remove(&key(section, k));
+                if at.is_some_and(|at| at.elapsed() < Duration::from_secs(5)) {
+                    COUNTS[REWRITTEN].fetch_add(1, Relaxed);
+                    WINDOW[1].fetch_add(1, Relaxed);
+                }
+            }
+        }
+    }
+
+    /// Whether only whole-section views show `page` now, and at least one.
+    fn only_whole_views(physical: &Physical, page: &Slice) -> bool {
+        let addresses = super::SHOWN.read().unwrap_or_else(|e| e.into_inner()).at(page);
+        let size = page.section.pages * PAGE;
+        !addresses.is_empty()
+            && addresses.iter().all(|&(a, _)| {
+                physical
+                    .views
+                    .range(..=a)
+                    .next_back()
+                    .is_some_and(|(&at, (len, slice))| at + len > a && *len == size && slice.index == 0)
+            })
+    }
+
+    /// A page lost a view (with the views' lock held): noted if it is
+    /// resident in our lasting view and only the pool view shows it now.
+    pub(super) fn unshown(physical: &Physical, page: &Slice) {
+        if !on() {
+            return;
+        }
+        let bit = 1u64 << (page.index % 64);
+        if page.index >= page.section.pages
+            || page.section.resident[page.index / 64].load(Relaxed) & bit == 0
+            || !only_whole_views(physical, page)
+        {
+            return;
+        }
+        UNSHOWN.lock().unwrap_or_else(|e| e.into_inner()).push_back((
+            Instant::now(),
+            Arc::downgrade(&page.section),
+            page.index,
+        ));
+        static STARTED: std::sync::Once = std::sync::Once::new();
+        STARTED.call_once(|| {
+            let _ = std::thread::Builder::new().name("victory-pool-discard".into()).spawn(discard_loop);
+        });
+    }
+
+    fn below() -> u64 {
+        static MB: OnceLock<u64> = OnceLock::new();
+        let mb = *MB.get_or_init(|| {
+            let mb = std::env::var("VICTORY_POOL_DISCARD_BELOW_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(4096);
+            tracing::info!(mb, "VICTORY_POOL_DISCARD_BELOW_MB: pool pages are discarded only while free RAM is under this (0: always)");
+            mb
+        });
+        if mb == 0 { u64::MAX } else { mb << 20 }
+    }
+
+    fn free_ram() -> Option<u64> {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        // SAFETY: plain data the call fills in.
+        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+        // SAFETY: a sized structure.
+        (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullAvailPhys)
+    }
+
+    fn delay_setting() -> u64 {
+        static S: OnceLock<u64> = OnceLock::new();
+        *S.get_or_init(|| {
+            let s = std::env::var("VICTORY_POOL_DISCARD_DELAY_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0);
+            tracing::info!(s, "VICTORY_POOL_DISCARD_DELAY_S: wait after a pool page's last unmapping before it is discarded (0: adaptive 2-10 s by pages rewritten within 5 s)");
+            s
+        })
+    }
+
+    /// The next adaptive delay from the last window's discards `d` and of
+    /// them rewritten within 5 s `r`, and free RAM: more than a quarter
+    /// rewritten doubles it (up to 10 s), under 5 % halves it (down to 2 s);
+    /// under 1 GiB free RAM it is 2 s.
+    pub(super) fn next_delay(ms: u64, d: u64, r: u64, free: Option<u64>) -> u64 {
+        if free.is_some_and(|f| f < 1 << 30) {
+            return 2000;
+        }
+        if d >= 64 && r * 4 > d {
+            (ms * 2).min(10_000)
+        } else if d >= 64 && r * 20 < d {
+            (ms / 2).max(2000)
+        } else {
+            ms
+        }
+    }
+
+    fn delay() -> Duration {
+        match delay_setting() {
+            0 => Duration::from_millis(DELAY_MS.load(Relaxed)),
+            s => Duration::from_secs(s),
+        }
+    }
+
+    fn discard_loop() {
+        use windows_sys::Win32::System::Memory::{MEM_RESET, PAGE_READWRITE, VirtualAlloc, VirtualUnlock};
+        let mut window = Instant::now();
+        let mut said = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            if window.elapsed() >= Duration::from_secs(5) {
+                window = Instant::now();
+                let (d, r) = (WINDOW[0].swap(0, Relaxed), WINDOW[1].swap(0, Relaxed));
+                DELAY_MS.store(next_delay(DELAY_MS.load(Relaxed), d, r, free_ram()), Relaxed);
+                DISCARDED_AT.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, at| at.elapsed() < Duration::from_secs(5));
+            }
+            if said.elapsed() >= Duration::from_secs(30) {
+                said = Instant::now();
+                tracing::info!("{}", line());
+            }
+            let quiet = delay();
+            if free_ram().is_some_and(|free| free >= below()) {
+                HELD_BY_RAM.store(true, Relaxed);
+                let mut queue = UNSHOWN.lock().unwrap_or_else(|e| e.into_inner());
+                let over = queue.len().saturating_sub(UNSHOWN_MOST);
+                queue.drain(..over);
+                continue;
+            }
+            HELD_BY_RAM.store(false, Relaxed);
+            let due: Vec<(Weak<Section>, usize)> = {
+                let mut queue = UNSHOWN.lock().unwrap_or_else(|e| e.into_inner());
+                let n = queue.iter().take_while(|(at, ..)| at.elapsed() >= quiet).count();
+                queue.drain(..n).map(|(_, section, index)| (section, index)).collect()
+            };
+            // Pieces of 1,024 pages, the lock let go between them.
+            for piece in due.chunks(1024) {
+                // (Sections the title freed meanwhile are gone: nothing to do.)
+                let pages: Vec<Slice> = piece
+                    .iter()
+                    .filter_map(|(section, index)| Some(Slice { section: section.upgrade()?, index: *index }))
+                    .collect();
+                let physical = super::physical();
+                // (lasting view base, first index, pages, section)
+                let mut runs: Vec<(usize, usize, usize, Arc<Section>)> = Vec::new();
+                for page in &pages {
+                    let section = &*page.section;
+                    let Some(&base) = section.window.get() else { continue };
+                    let bit = 1u64 << (page.index % 64);
+                    if base == 0 || section.resident[page.index / 64].load(Relaxed) & bit == 0 || !only_whole_views(&physical, page) {
+                        continue;
+                    }
+                    section.resident[page.index / 64].fetch_and(!bit, Relaxed);
+                    section.discarded[page.index / 64].fetch_or(bit, Relaxed);
+                    DISCARDED_AT.lock().unwrap_or_else(|e| e.into_inner()).insert(key(section, page.index), Instant::now());
+                    WINDOW[0].fetch_add(1, Relaxed);
+                    match runs.last_mut() {
+                        Some((b, first, n, _)) if *b == base && *first + *n == page.index => *n += 1,
+                        _ => runs.push((base, page.index, 1, page.section.clone())),
+                    }
+                }
+                for (base, first, n, section) in runs {
+                    let (at, len) = ((base + first * PAGE) as *mut core::ffi::c_void, n * PAGE);
+                    // SAFETY: committed pages of our lasting view whose bytes
+                    // are dead (above); the lock keeps maps of them out, and
+                    // `section` keeps the view.
+                    let reset = unsafe { VirtualAlloc(at, len, MEM_RESET, PAGE_READWRITE) };
+                    if reset.is_null() && COUNTS[FAILED].fetch_add(1, Relaxed) == 0 {
+                        tracing::warn!(error = %std::io::Error::last_os_error(), "VICTORY_POOL_DISCARD: MEM_RESET refused (taken out of the working set only)");
+                    }
+                    // SAFETY: as above; on pages not locked this only takes
+                    // them out of the working set.
+                    unsafe { VirtualUnlock(at, len) };
+                    victory_gpu::unlock_beside(section.handle as usize, (first * PAGE) as u64, len);
+                    COUNTS[RESIDENT].fetch_sub(n as u64, Relaxed);
+                    COUNTS[DISCARDED].fetch_add(n as u64, Relaxed);
+                }
+                drop(physical);
+                // (The last hold on a section the title freed meanwhile
+                // goes here, without the views' lock.)
+                drop(pages);
+            }
+        }
+    }
+
+    /// "pool discard: ..." with the process's working set.
+    fn line() -> String {
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut c = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+        // SAFETY: our own process and a sized structure.
+        unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+        let mb = |pages: u64| (pages * PAGE as u64) >> 20;
+        let failed = COUNTS[FAILED].load(Relaxed);
+        format!(
+            "pool discard: pool pages resident {} MB, discarded this run {} MB, rewritten within 5 s of a discard {} MB (delay {} ms), working set {} MB (peak {} MB) (VICTORY_POOL_DISCARD=1{}; only under {} MB free RAM, VICTORY_POOL_DISCARD_BELOW_MB{})",
+            mb(COUNTS[RESIDENT].load(Relaxed)),
+            mb(COUNTS[DISCARDED].load(Relaxed)),
+            mb(COUNTS[REWRITTEN].load(Relaxed)),
+            delay().as_millis(),
+            c.WorkingSetSize >> 20,
+            c.PeakWorkingSetSize >> 20,
+            if failed == 0 { String::new() } else { format!(", resets refused {failed}") },
+            if below() == u64::MAX { "any".to_owned() } else { (below() >> 20).to_string() },
+            if HELD_BY_RAM.load(Relaxed) { "; held now: RAM plentiful" } else { "" },
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::next_delay;
+
+        #[test]
+        fn the_discard_delay_adapts_to_pages_rewritten_soon() {
+            let plenty = Some(8u64 << 30);
+            assert_eq!(next_delay(2000, 100, 30, plenty), 4000);
+            assert_eq!(next_delay(8000, 100, 30, plenty), 10_000);
+            assert_eq!(next_delay(4000, 100, 2, plenty), 2000);
+            assert_eq!(next_delay(4000, 100, 10, plenty), 4000);
+            assert_eq!(next_delay(4000, 10, 10, plenty), 4000, "too few discards to judge");
+            assert_eq!(next_delay(8000, 100, 30, Some(512 << 20)), 2000, "short of RAM");
         }
     }
 }
@@ -1920,6 +2445,10 @@ pub struct WorkingSet {
 // not split by bandwidth class (GPU-optimal use reads 0); track
 // allocations per class if a title budgets from that field.
 pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut WorkingSet) -> BOOL {
+    static CALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !CALLED.swap(true, Ordering::Relaxed) {
+        tracing::info!(which = _which, "XMemGetWorkingSetStatistics called by title");
+    }
     if out.is_null() {
         return 0;
     }
@@ -2686,5 +3215,131 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn lazy_pool_commit_fault_commits_page_on_demand() {
+        if on_wine() {
+            return;
+        }
+        let pages = 4;
+        // SAFETY: plain section creation.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_RESERVE,
+                0,
+                (pages * PAGE) as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!handle.is_null());
+        let section = Arc::new(Section {
+            handle,
+            pages,
+            window: std::sync::OnceLock::new(),
+            committed: (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+            resident: (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+            discarded: (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+        });
+        let placeholder = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            pages * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!placeholder.is_null());
+        // SAFETY: `placeholder` is a placeholder of `pages * PAGE` bytes for `handle`.
+        let view = unsafe {
+            MapViewOfFile3(
+                section.handle,
+                GetCurrentProcess(),
+                placeholder,
+                0,
+                pages * PAGE,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(view.Value, placeholder);
+        let view_base = view.Value as usize;
+        LAZY_POOLS
+            .write()
+            .unwrap()
+            .push((view_base, pages * PAGE, Arc::downgrade(&section)));
+
+        assert!(lazy_pool_commit_fault(view_base + PAGE + 128));
+        assert_ne!(section.committed[0].load(Ordering::Acquire) & (1 << 1), 0);
+        assert_eq!(section.committed[0].load(Ordering::Acquire) & 1, 0);
+        // SAFETY: page 1 was just committed read-write.
+        unsafe {
+            let ptr = (view_base + PAGE) as *mut u64;
+            ptr.write_volatile(0x1234_5678_9abc_def0);
+            assert_eq!(ptr.read_volatile(), 0x1234_5678_9abc_def0);
+        }
+
+        LAZY_POOLS.write().unwrap().retain(|(b, _, _)| *b != view_base);
+        // SAFETY: our own mapped view.
+        assert_ne!(unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, 0) }, 0);
+        drop(section);
+    }
+
+    #[test]
+    fn unique_committed_pages_count_each_section_page_once() {
+        let pages = 2;
+        // SAFETY: plain section creation.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+                0,
+                (pages * PAGE) as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!handle.is_null());
+        let section = Arc::new(Section {
+            handle,
+            pages,
+            window: std::sync::OnceLock::new(),
+            committed: (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+            resident: (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+            discarded: (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+        });
+        let reserve = || {
+            XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            )
+        };
+        let (a, b) = (reserve(), reserve());
+        assert!(!a.is_null() && !b.is_null());
+        // SAFETY: placeholders for 1-page views of `section`.
+        let (va, vb) = unsafe {
+            (
+                MapViewOfFile3(section.handle, GetCurrentProcess(), a, 0, PAGE, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0),
+                MapViewOfFile3(section.handle, GetCurrentProcess(), b, 0, PAGE, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0),
+            )
+        };
+        assert_eq!(va.Value, a);
+        assert_eq!(vb.Value, b);
+        assert!(section.commit_shown(0, a as usize, PAGE));
+        assert!(section.commit_shown(0, b as usize, PAGE));
+        let popcount: u32 = section.committed.iter().map(|w| w.load(Ordering::Relaxed).count_ones()).sum();
+        assert_eq!(popcount, 1);
+        // SAFETY: our own mapped views.
+        unsafe {
+            assert_ne!(UnmapViewOfFile2(GetCurrentProcess(), va, 0), 0);
+            assert_ne!(UnmapViewOfFile2(GetCurrentProcess(), vb, 0), 0);
+        }
+        drop(section);
     }
 }

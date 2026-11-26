@@ -16,14 +16,12 @@ as it was, with one correction (XCL, under its Credits).
 
 ## What this fork adds
 
-- **Three branches merged**, each on top of the self-healing pipelines (a driver
+- **Branches merged**, each on top of the self-healing pipelines (a driver
   crash in a pipeline compile is bisected to the instruction to disable, and the
   fallback is cached per shader and driver):
   - crash fallback at run time: a shader that crashes the driver is made with
     its culprit instruction disabled instead of being left out;
-  - the submission-preparing thread split in two, opt-in (`VICTORY_SUBMIT_SPLIT=1`);
-  - D3D12 specialization-constant plumbing for compute pipelines (no caller uses it
-    yet).
+  - the submission-preparing thread split in two, opt-in (`VICTORY_SUBMIT_SPLIT=1`).
 - **Pipeline isolation that works** (`VICTORY_PIPELINE_ISOLATE=1`: each new
   pipeline is first compiled in a child process, so a driver crash costs the child,
   not the run):
@@ -33,14 +31,20 @@ as it was, with one correction (XCL, under its Credits).
   - pipelines a child has made without a crash are remembered in the cache's
     `warm-done.txt` (the list `victory warm` keeps, per translator and driver), so
     later launches skip the test for them;
-  - a shader's cached fallback now reaches the child (`VICTORY_PENDING_FALLBACK`),
-    and is also used without isolation;
-  - at most `VICTORY_CANARY_JOBS` children at once (16 by default), and each child
+  - a shader's cached fallback now reaches the child, and is also used without
+    isolation;
+  - at most `VICTORY_CANARY_JOBS` children at once (4 by default), and each child
     that dies is logged with its exit code.
 - **Measurements** (diagnostics builds): `VICTORY_SLEEP_COUNT=1` counts and times
   the title's `Sleep(0)`, `SleepEx` and `SwitchToThread` and logs them per frame;
   each `monitorx`/`mwaitx` replaced in the title's code is logged with its place,
   so `VICTORY_PROFILE` samples can be matched to the spin loops around them.
+- **Mouse controls** (on by default): left-clicking the title window captures
+  the cursor and turns raw mouse motion into the pad's right stick; left/right
+  mouse buttons pull the right/left triggers and middle-click presses the right
+  stick. `Alt` or losing focus releases the cursor. `VICTORY_MOUSE=0` turns it
+  off; `VICTORY_MOUSE_FULL`, `VICTORY_MOUSE_SMOOTH_MS`,
+  `VICTORY_MOUSE_DEADZONE` and `VICTORY_MOUSE_INVERT=1` tune it.
 
 ## How to run it
 

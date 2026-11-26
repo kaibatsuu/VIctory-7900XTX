@@ -27,9 +27,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 const FORMAT: u32 = 2;
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, SpecConstant, SpecValue, StaticSampler, UserData};
+use victory_shader::emit::{HostShader, StaticSampler, UserData};
 use victory_shader::resource::RootIndexedView;
-use victory_shader::{HwStage, RootType};
+use victory_shader::{HwStage, ResourceType, RootType, UsedResource};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
@@ -168,8 +168,12 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
     let misses = MISSES.load(Ordering::Relaxed);
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate, true)?,
-        None => translate(container)?,
+        Some(cache) => {
+            let _ = cached(cache, &build(), container, translate, true)?;
+        }
+        None => {
+            translate(container)?;
+        }
     };
     // (Counts other threads' misses too: the caller only adds them up.)
     Ok(MISSES.load(Ordering::Relaxed) == misses)
@@ -177,19 +181,19 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 
 /// The translation of a console shader container, from the cache when
 /// there is one.
-pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    host_shader_with(container, &[])
-}
-
-/// As [`host_shader`], with the mnemonics of `disabled` lowered as no-ops
+/// The translation of a console shader container, from the cache when there
+/// is one, with the mnemonics of `disabled` lowered as no-ops
 /// (the driver-crash bisect's fallback). The disabled set is part of the
 /// translation fingerprint, so a fallback translation is cached apart from
 /// the normal one.
-pub(crate) fn host_shader_with(container: &[u8], disabled: &[String]) -> Result<HostShader, String> {
+pub(crate) fn host_shader_with(container: &[u8], disabled: &[String]) -> Result<(HostShader, Meta), String> {
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, disabled).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, &build_with(disabled), container, translate, refresh_in_runs()),
-        None => translate(container),
+        None => {
+            let shader = translate(container)?;
+            Ok((shader, meta_of(container)))
+        }
     }
 }
 
@@ -227,8 +231,10 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
-        Ok(encode(&shader, self.source))
+        let container = &input[32..];
+        let shader = (self.translate)(container).map_err(anyhow::Error::msg)?;
+        let meta = meta_of(container);
+        Ok(encode(&shader, Some(&meta), self.source))
     }
 }
 
@@ -240,7 +246,7 @@ fn cached(
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
     refresh: bool,
-) -> Result<HostShader, String> {
+) -> Result<(HostShader, Meta), String> {
     cached_by(cache, build, SOURCE, container, translate, refresh)
 }
 
@@ -252,8 +258,7 @@ fn cached_by(
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
     refresh: bool,
-) -> Result<HostShader, String> {
-    let input = [&build[..], container].concat();
+) -> Result<(HostShader, Meta), String> {
     let converter = Translate {
         translate,
         source,
@@ -261,10 +266,10 @@ fn cached_by(
     };
     let mut old: Option<HostShader> = None;
     for _ in 0..3 {
-        let path = cache
-            .get_or_convert(&converter, &input)
+        let (path, bytes) = cache
+            .read_or_convert_parts(&converter, &[&build[..], container])
             .map_err(|e| format!("{e:#}"))?;
-        if let Some((shader, made_by)) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
+        if let Some((shader, meta, made_by)) = decode(&bytes) {
             let ran = converter.ran.load(Ordering::Relaxed);
             if !ran && made_by != source.as_bytes() {
                 STALE.fetch_add(1, Ordering::Relaxed);
@@ -287,6 +292,16 @@ fn cached_by(
                     CHANGED.fetch_add(1, Ordering::Relaxed);
                 }
             }
+            // A VSH2 entry has no metadata: compute it once (single decode)
+            // and upgrade the entry in place, without re-translating.
+            let meta = match meta {
+                Some(meta) => meta,
+                None => {
+                    let meta = meta_of(container);
+                    let _ = std::fs::write(&path, encode(&shader, Some(&meta), source));
+                    meta
+                }
+            };
             let (counter, what) = if ran {
                 (&MISSES, "translated and cached")
             } else {
@@ -294,16 +309,20 @@ fn cached_by(
             };
             counter.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(path = %path.display(), "shader {what}");
-            return Ok(shader);
+            return Ok((shader, meta));
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
         let _ = std::fs::remove_file(&path);
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
-    (converter.translate)(container)
+    let shader = (converter.translate)(container)?;
+    Ok((shader, meta_of(container)))
 }
 
-const MAGIC: &[u8; 4] = b"VSH2";
+const MAGIC: &[u8; 4] = b"VSH3";
+/// The encoding before [`Meta`] was in the entry: decoded as it is (no
+/// metadata), then upgraded in place after one re-analysis.
+const MAGIC_V2: &[u8; 4] = b"VSH2";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -339,10 +358,72 @@ fn root_type(code: u32) -> RootType {
     }
 }
 
+fn used_code(kind: ResourceType) -> u32 {
+    match kind {
+        ResourceType::Srv => 0,
+        ResourceType::Sampler => 1,
+        ResourceType::Cbv => 2,
+        ResourceType::Uav => 3,
+        ResourceType::Other(x) => 4 + u32::from(x),
+    }
+}
+
+fn used_kind(code: u32) -> ResourceType {
+    match code {
+        0 => ResourceType::Srv,
+        1 => ResourceType::Sampler,
+        2 => ResourceType::Cbv,
+        3 => ResourceType::Uav,
+        x => ResourceType::Other((x - 4) as u8),
+    }
+}
+
+/// What a VSH3 entry carries beside the [`HostShader`], so a hit skips
+/// parsing the container and decoding its code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Meta {
+    pub(crate) threads: Option<[u32; 3]>,
+    pub(crate) used: Vec<UsedResource>,
+    pub(crate) stores: bool,
+    pub(crate) stores_by_address: bool,
+}
+
+/// The [`Meta`] of `container`, from its native programs (one decode for both
+/// store kinds, via [`victory_shader::analyze_stores`]).
+fn meta_of(container: &[u8]) -> Meta {
+    use victory_shader::{Container, FourCC, HwStage};
+    let Ok(c) = Container::parse(container) else {
+        return Meta { threads: None, used: Vec::new(), stores: true, stores_by_address: true };
+    };
+    let programs = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
+        Some(part) => victory_shader::native_programs(part.data).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let threads = programs.iter().find_map(|p| match &p.io {
+        victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
+        _ => None,
+    });
+    let (mut stores, mut stores_by_address) = (programs.is_empty(), programs.is_empty());
+    for p in &programs {
+        let (s, a) = victory_shader::analyze_stores(p);
+        stores |= s;
+        stores_by_address |= a;
+    }
+    let used = programs
+        .into_iter()
+        .find(|p| matches!(p.stage, HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs))
+        .map(|p| p.used)
+        .unwrap_or_default();
+    Meta { threads, used, stores, stores_by_address }
+}
+
 /// Little-endian words and length-prefixed lists, after the build of the
 /// translator that made the entry (`source`, length-prefixed).
-fn encode(s: &HostShader, source: &str) -> Vec<u8> {
-    let mut out = MAGIC.to_vec();
+fn encode(s: &HostShader, meta: Option<&Meta>, source: &str) -> Vec<u8> {
+    let mut out = match meta {
+        Some(_) => MAGIC.to_vec(),
+        None => MAGIC_V2.to_vec(),
+    };
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
     word(&mut out, source.len() as u32);
     out.extend(source.as_bytes());
@@ -397,39 +478,66 @@ fn encode(s: &HostShader, source: &str) -> Vec<u8> {
             word(&mut out, value);
         }
     }
-    word(&mut out, s.spec_constants.len() as u32);
-    for spec in &s.spec_constants {
-        let (tag, bits) = match spec.default {
-            SpecValue::U32(v) => (0, v),
-            SpecValue::I32(v) => (1, v as u32),
-            SpecValue::F32(v) => (2, v.to_bits()),
-        };
-        for value in [spec.id, tag, bits, spec.offset_bits] {
-            word(&mut out, value);
+    // A count of specialization constants, always 0: kept so the entries
+    // already cached in this layout still read (the constants are gone).
+    word(&mut out, 0);
+    if let Some(meta) = meta {
+        // Meta (VSH3): one decode's worth of the container's programs.
+        match meta.threads {
+            Some([x, y, z]) => {
+                word(&mut out, 1);
+                for v in [x, y, z] {
+                    word(&mut out, v);
+                }
+            }
+            None => word(&mut out, 0),
+        }
+        word(&mut out, u32::from(meta.stores));
+        word(&mut out, u32::from(meta.stores_by_address));
+        word(&mut out, meta.used.len() as u32);
+        for u in &meta.used {
+            for v in [
+                used_code(u.kind),
+                root_code(u.root),
+                u.table_offset_dwords,
+                u.lower_bound,
+                u.stride,
+                u32::from(u.dwords),
+                u32::from(u.user_data),
+                u32::from(u.slot),
+            ] {
+                word(&mut out, v);
+            }
         }
     }
     out
 }
 
-/// The shader and the build of the translator that made it.
-fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
-    struct Reader<'a>(&'a [u8]);
-    impl<'a> Reader<'a> {
-        fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-            let (head, rest) = self.0.split_at_checked(n)?;
-            self.0 = rest;
-            Some(head)
-        }
-        fn word(&mut self) -> Option<u32> {
-            Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
-        }
-        fn list(&mut self) -> Option<Vec<u8>> {
-            let n = self.word()? as usize;
-            Some(self.take(n)?.to_vec())
-        }
+/// A cursor over an entry's bytes.
+struct Reader<'a>(&'a [u8]);
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let (head, rest) = self.0.split_at_checked(n)?;
+        self.0 = rest;
+        Some(head)
     }
+    fn word(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn list(&mut self) -> Option<Vec<u8>> {
+        let n = self.word()? as usize;
+        Some(self.take(n)?.to_vec())
+    }
+}
+
+/// The shader, its [`Meta`] (VSH3 only; `None` for a VSH2 entry), and the
+/// build of the translator that made it.
+fn decode(bytes: &[u8]) -> Option<(HostShader, Option<Meta>, Vec<u8>)> {
     let mut r = Reader(bytes);
-    if r.take(4)? != MAGIC {
+    let magic = r.take(4)?;
+    let v3 = magic == MAGIC;
+    if !v3 && magic != MAGIC_V2 {
         return None;
     }
     let made_by = r.list()?;
@@ -478,37 +586,52 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
-    let n = r.word()? as usize;
-    let mut spec_constants = Vec::with_capacity(n.min(256));
-    for _ in 0..n {
-        let id = r.word()?;
-        let default = match r.word()? {
-            0 => SpecValue::U32(r.word()?),
-            1 => SpecValue::I32(r.word()? as i32),
-            2 => SpecValue::F32(f32::from_bits(r.word()?)),
-            _ => return None,
-        };
-        spec_constants.push(SpecConstant {
-            id,
-            default,
-            offset_bits: r.word()?,
-        });
+    // The specialization constants' count ([`encode`]): an entry with any
+    // is a miss, translated again.
+    if r.word()? != 0 {
+        return None;
     }
+    let meta = if v3 { Some(decode_meta(&mut r)?) } else { None };
     r.0.is_empty().then_some((
         HostShader {
-        stage,
-        dxil,
-        user_data,
-        samplers,
-        static_samplers,
-        root_cbvs,
-        root_srvs,
-        root_uavs,
-        root_indexed_views,
-        spec_constants,
+            stage,
+            dxil,
+            user_data,
+            samplers,
+            static_samplers,
+            root_cbvs,
+            root_srvs,
+            root_uavs,
+            root_indexed_views,
         },
+        meta,
         made_by,
     ))
+}
+
+fn decode_meta(r: &mut Reader) -> Option<Meta> {
+    let threads = match r.word()? {
+        1 => Some([r.word()?, r.word()?, r.word()?]),
+        0 => None,
+        _ => return None,
+    };
+    let stores = r.word()? != 0;
+    let stores_by_address = r.word()? != 0;
+    let n = r.word()? as usize;
+    let mut used = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        used.push(UsedResource {
+            kind: used_kind(r.word()?),
+            root: root_type(r.word()?),
+            table_offset_dwords: r.word()?,
+            lower_bound: r.word()?,
+            stride: r.word()?,
+            dwords: u8::try_from(r.word()?).ok()?,
+            user_data: u8::try_from(r.word()?).ok()?,
+            slot: u8::try_from(r.word()?).ok()?,
+        });
+    }
+    Some(Meta { threads, used, stores, stores_by_address })
 }
 
 #[cfg(test)]
@@ -542,7 +665,6 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
-            spec_constants: Vec::new(),
         }
     }
 
@@ -557,21 +679,21 @@ mod tests {
             runs.fetch_add(1, Ordering::Relaxed);
             Ok(shader())
         };
-        assert_eq!(cached(&cache, &build, container, translate, false), Ok(shader()));
-        assert_eq!(cached(&cache, &build, container, translate, false), Ok(shader()));
+        assert_eq!(cached(&cache, &build, container, translate, false).map(|(s, _)| s), Ok(shader()));
+        assert_eq!(cached(&cache, &build, container, translate, false).map(|(s, _)| s), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 1, "the second came from disk");
 
         // Another build translates again.
-        assert_eq!(cached(&cache, &[8; 32], container, translate, false), Ok(shader()));
+        assert_eq!(cached(&cache, &[8; 32], container, translate, false).map(|(s, _)| s), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 2);
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
             std::fs::write(e, b"VSH2 broken").unwrap();
         }
-        assert_eq!(cached(&cache, &build, container, translate, false), Ok(shader()));
+        assert_eq!(cached(&cache, &build, container, translate, false).map(|(s, _)| s), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
-        assert_eq!(cached(&cache, &build, container, translate, false), Ok(shader()));
+        assert_eq!(cached(&cache, &build, container, translate, false).map(|(s, _)| s), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
 
         // Failures are not stored.
@@ -591,13 +713,21 @@ mod tests {
         files
     }
 
+    fn meta() -> Meta {
+        Meta { threads: None, used: Vec::new(), stores: false, stores_by_address: false }
+    }
+
     #[test]
     fn entries_round_trip_and_reject_damage() {
-        let bytes = encode(&shader(), "made by");
-        assert_eq!(decode(&bytes), Some((shader(), b"made by".to_vec())));
+        // A VSH3 entry (with its metadata).
+        let bytes = encode(&shader(), Some(&meta()), "made by");
+        assert_eq!(decode(&bytes), Some((shader(), Some(meta()), b"made by".to_vec())));
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+        // A VSH2 entry (no metadata) decodes as such, so it can be upgraded.
+        let v2 = encode(&shader(), None, "made by");
+        assert_eq!(decode(&v2), Some((shader(), None, b"made by".to_vec())));
         // Entries of the encoding before the translator's build was in them.
         let mut v1 = bytes.clone();
         v1[3] = b'1';
@@ -623,20 +753,20 @@ mod tests {
             runs.fetch_add(1, Ordering::Relaxed);
             Ok(old())
         };
-        assert_eq!(cached_by(&cache, &build, "build a", container, first, false), Ok(old()));
+        assert_eq!(cached_by(&cache, &build, "build a", container, first, false).map(|(s, _)| s), Ok(old()));
         let now = |_: &[u8]| {
             runs.fetch_add(1, Ordering::Relaxed);
             Ok(shader())
         };
         let (stale, refreshed, changed) = stale_counts();
         // The next build, same version: the old translation, not translated.
-        assert_eq!(cached_by(&cache, &build, "build b", container, now, false), Ok(old()));
+        assert_eq!(cached_by(&cache, &build, "build b", container, now, false).map(|(s, _)| s), Ok(old()));
         assert_eq!(runs.load(Ordering::Relaxed), 1);
         // Refreshing: translated again and kept.
-        assert_eq!(cached_by(&cache, &build, "build b", container, now, true), Ok(shader()));
+        assert_eq!(cached_by(&cache, &build, "build b", container, now, true).map(|(s, _)| s), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 2);
         // Now the entry is this build's: served when refreshing too.
-        assert_eq!(cached_by(&cache, &build, "build b", container, now, true), Ok(shader()));
+        assert_eq!(cached_by(&cache, &build, "build b", container, now, true).map(|(s, _)| s), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 2);
         // (Other tests count too; these at least.)
         let (s, r, c) = stale_counts();
