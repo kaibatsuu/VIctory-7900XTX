@@ -427,7 +427,7 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
 
 /// Once a second, before a submission starts: lets go of what nothing
 /// names any more (copies of windows of title memory, staging buffers,
-/// host copies of textures the title fills).
+/// host copies of textures the title fills; idle host lists, when asked).
 /// `VICTORY_SWEEP=0` keeps everything, as before.
 fn sweep() {
     // The in-place probe and census, if asked for (`VICTORY_INPLACE_PROBE`).
@@ -448,11 +448,16 @@ fn sweep() {
     }
     #[cfg(feature = "diagnostics")]
     crate::book::check();
+    // Whether the PC is short of memory, for the pools' room and the
+    // texture pass (`VICTORY_RESIDENCY=1`; nothing otherwise).
+    crate::residency::refresh();
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    // Host lists idle for `VICTORY_LIST_POOL_IDLE_S` (off by default).
+    crate::list::let_go_idle_lists();
 }
 
 /// The number of the newest submission begun, and of the newest of which all
@@ -8718,6 +8723,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
             }

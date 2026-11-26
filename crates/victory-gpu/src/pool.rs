@@ -41,8 +41,29 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
 /// Asked once a second.
+///
+/// With `VICTORY_RESIDENCY=1` ([`crate::residency`], from codec_d's
+/// 18bdf79): [`SPARE`] while the PC is short of memory
+/// ([`crate::residency::pressured`]), and the empty blocks past the limit go
+/// at once instead of when a piece next comes back; of the staging blocks,
+/// which are the PC's memory, all of them under pressure.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
-    SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+    if !crate::residency::on() {
+        SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+        return;
+    }
+    let pressure = crate::residency::pressured();
+    let limit = spares(memory, crate::host::keep_freed() && !pressure);
+    SPARES.store(limit, Ordering::Relaxed);
+    let tick = now();
+    // A full pool can become idle while another subsystem needs the VRAM.
+    // A busy allocator observes the new limit on its next allocation or tick.
+    if let Ok(mut pool) = TEXTURES.try_lock() {
+        pool.reclaim(tick, limit, true);
+    }
+    if let Ok(mut pool) = STAGING.try_lock() {
+        pool.reclaim(tick, if pressure { 0 } else { limit }, true);
+    }
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
@@ -227,6 +248,8 @@ impl<B: Clone> Pool<B> {
             unripe.sort_unstable();
             found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
         }
+        // A failed 64 MiB block must not trigger another driver call for each
+        // small texture. Existing free ranges remain usable during backoff.
         let (i, start) = match found {
             Some(found) => found,
             None => {
@@ -285,6 +308,14 @@ impl<B: Clone> Pool<B> {
     /// Makes the pieces that rested long enough free, and lets go of empty
     /// blocks past [`SPARE`].
     fn rested(&mut self, now: u64) {
+        self.reclaim(now, SPARES.load(Ordering::Relaxed), false);
+    }
+
+    /// [`Pool::rested`] keeping at most `limit` empty blocks; `sweep`: those
+    /// past it go even if no piece came back and the limit did not fall (the
+    /// once-a-second tick of [`room`]). A piece that has not rested, and a
+    /// block with a piece taken, stay.
+    fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) {
         let mut any = false;
         while let Some(&(ready, piece)) = self.resting.front()
             && ready <= now
@@ -296,8 +327,8 @@ impl<B: Clone> Pool<B> {
             }
         }
         // (Without a piece given back too, once there is less room.)
-        let most = SPARES.load(Ordering::Relaxed).min(self.most);
-        if any || most < self.spare {
+        let most = limit.min(self.most);
+        if sweep || any || most < self.spare {
             self.spare = most;
             let mut spare = 0;
             for block in &mut self.blocks {
@@ -639,6 +670,7 @@ pub(crate) unsafe fn texture(
         let mut heap: Option<ID3D12Heap> = None;
         // SAFETY: plain creation.
         if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
+            crate::residency::allocation_error(&e);
             tracing::warn!(error = %e, "no block of texture memory");
         }
         if let Some(h) = &heap
@@ -710,6 +742,63 @@ mod tests {
         assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
         assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
+    }
+
+    /// The upload sizes of codec_d's out-of-memory report (ab75ac3): one
+    /// refused block makes no driver call for each of them for 500 ms.
+    #[test]
+    fn a_failed_block_is_not_retried_for_each_small_upload() {
+        let mut pool: Pool<u32> = Pool::new(2);
+        let calls = std::cell::Cell::new(0);
+        let refuse = || {
+            calls.set(calls.get() + 1);
+            None
+        };
+        for size in [704008, 179720, 179720, 24080, 48648, 524288, 89616, 351760] {
+            assert!(pool.take(size, 512, 12, refuse).is_none());
+        }
+        assert_eq!(calls.get(), 1);
+        assert!(pool.take(24080, 512, 1012, || Some(1)).is_some());
+    }
+
+    /// The tick of [`room`] (18bdf79): empty blocks past the limit go at
+    /// once, pieces still resting and blocks with a piece taken stay.
+    #[test]
+    fn budget_tick_reclaims_idle_blocks_without_reusing_live_or_resting_pieces() {
+        let mut pool = Pool::new(STAGING_KEPT);
+        let (held, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(1)).unwrap();
+        let (resting, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(2)).unwrap();
+        pool.give(resting, 0);
+        for i in 0..12 {
+            pool.add(i, 0);
+        }
+        pool.reclaim(0, SPARE_KEPT, true);
+        assert_eq!(pool.blocks(), STAGING_KEPT + 1);
+        pool.reclaim(REST - 1, SPARE, true);
+        assert_eq!(pool.blocks(), SPARE + 1);
+        assert_eq!(pool.resting.len(), 1);
+        pool.reclaim(REST, 0, true);
+        assert_eq!(pool.blocks(), 1);
+        assert!(pool.resting.is_empty());
+        pool.give(held, REST);
+        pool.reclaim(2 * REST, 0, true);
+        assert_eq!(pool.blocks(), 0);
+    }
+
+    /// Without the tick ([`Pool::rested`]) empty blocks go only when a piece
+    /// comes back or the limit falls, as before 18bdf79.
+    #[test]
+    fn without_the_tick_empty_blocks_wait_for_a_piece_or_less_room() {
+        let mut pool: Pool<u32> = Pool::new(STAGING_KEPT);
+        for i in 0..4 {
+            pool.add(i, 0);
+        }
+        pool.reclaim(0, SPARE, false);
+        assert_eq!(pool.blocks(), 4);
+        let (piece, _, _) = pool.take(BLOCK / 2, 1, 0, || None).unwrap();
+        pool.give(piece, 0);
+        pool.reclaim(REST, SPARE, false);
+        assert_eq!(pool.blocks(), SPARE);
     }
 
     #[test]
