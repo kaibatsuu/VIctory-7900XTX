@@ -58,6 +58,15 @@ pub(crate) fn wanted() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_THIN").is_some_and(|v| v == "1"))
 }
 
+/// Whether a recording's list of ours is given back once the card has run
+/// its submission (`VICTORY_LIST_RELEASE=1`), instead of when the title
+/// resets or releases the list. Off: the recording keeps its list until
+/// then, as before.
+pub(crate) fn release() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_RELEASE").is_some_and(|v| v == "1"))
+}
+
 /// What a title list keeps: the recording being written and the words of it
 /// not handed over yet.
 #[derive(Default)]
@@ -228,6 +237,21 @@ impl Recording {
         held(&self.inner).back as This
     }
 
+    /// The list of ours a submission runs, taken from the recording (with
+    /// [`release`] only): a fresh one is made if the last was taken already,
+    /// as when the title submits the closed list again. The list is then no
+    /// longer the recording's: it is given back once the card has run it
+    /// ([`crate::list::recycle`]).
+    pub(crate) fn take_back(&self) -> This {
+        let mut inner = held(&self.inner);
+        if inner.back == 0 {
+            inner.back = back_list(self.kind) as usize;
+        }
+        let back = inner.back as This;
+        inner.back = 0;
+        back
+    }
+
     /// Translates what there is.
     fn run(&self) {
         loop {
@@ -297,6 +321,12 @@ fn back_list(kind: u32) -> This {
     let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
     super::close(list);
     list
+}
+
+/// A recording's list of ours, whose host the submission took and ran: back
+/// in the pool (it is closed, as [`back_list`] expects).
+pub(crate) fn give_back_list(this: usize) {
+    held(&BACKS).push(this);
 }
 
 fn start() {
