@@ -80,6 +80,47 @@ fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
 /// a second, with up to 18 submissions in the air.)
 const REST: u64 = 2500;
 
+/// (Fox F, memory audit item 1; from Op-lite/victory-scarlett c45b43e)
+/// Milliseconds until a staging buffer's piece, given back, is used again
+/// (`VICTORY_STAGING_REST_MS`; unset: [`REST`], as before).
+///
+/// A staging piece comes back only when the last host list that recorded its
+/// copy is reset, and a list is reset only after every submission of it has
+/// run (`HostList::reset`): the card is done reading it then, so the rest is
+/// a second guard only. At 130-890 MB/s of uploads, 2.5 s of rest held
+/// 0.7-3.4 GB of staging blocks for 60-240 MB live (their run-121). A/B
+/// candidates: `250`, `0`; watch the memory line's staging MiB and "made
+/// again" not rising.
+fn staging_rest() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        let ms = std::env::var("VICTORY_STAGING_REST_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(REST);
+        if ms != REST {
+            tracing::info!(
+                ms,
+                "staging pieces rest {ms} ms before they are used again (VICTORY_STAGING_REST_MS; default {REST})"
+            );
+        }
+        ms
+    })
+}
+
+/// (Fox F, memory audit item 1; from Op-lite/victory-scarlett c45b43e)
+/// `VICTORY_STAGING_PACK=1` (off by default): a staging piece goes into the
+/// fullest block it fits, as `VICTORY_HEAP_PACK` does for textures, and at
+/// most [`STAGING_PACKED_KEPT`] empty staging blocks stay, so blocks empty
+/// and go instead of one holding a few pieces forever.
+fn staging_pack() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_STAGING_PACK").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Empty staging blocks kept with [`staging_pack`] (128 MiB).
+const STAGING_PACKED_KEPT: usize = 2;
+
 fn now() -> u64 {
     crate::host::now_ms()
 }
@@ -213,11 +254,23 @@ struct Pool<B> {
     given_back: u64,
     /// ([`heap_pack`]) Pieces go into the fullest block they fit.
     pack: bool,
+    /// Milliseconds a piece given back rests ([`REST`]; the staging pool:
+    /// [`staging_rest`]), so that the two pools may rest differently.
+    rest: u64,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0, given_back: 0, pack: false }
+        Pool {
+            blocks: Vec::new(),
+            resting: VecDeque::new(),
+            spare: 0,
+            most,
+            retry_growth_at: 0,
+            given_back: 0,
+            pack: false,
+            rest: REST,
+        }
     }
 
     /// ([`heap_pack`]) Of the blocks `ripe` takes, the fullest one `len`
@@ -333,7 +386,7 @@ impl<B: Clone> Pool<B> {
     }
 
     fn give(&mut self, piece: Piece, now: u64) {
-        self.resting.push_back((now + REST, piece));
+        self.resting.push_back((now + self.rest, piece));
     }
 
     /// Makes the pieces that rested long enough free, and lets go of empty
@@ -424,17 +477,28 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     }
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
-    let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
-        // (`VICTORY_RESIDENCY=1`: no new block for a texture picked by index
-        // while commit is short; those a draw samples now still get one.)
-        let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
-        if speculative && !crate::residency::allow_staging_growth(false) {
-            return None;
+    // (Fox F, memory audit item 1) The staging pool's own rest and packing
+    // (`VICTORY_STAGING_REST_MS`, `VICTORY_STAGING_PACK`).
+    let taken = {
+        let mut pool = lock(&STAGING);
+        pool.rest = staging_rest();
+        if staging_pack() {
+            pool.pack = true;
+            pool.most = STAGING_PACKED_KEPT;
         }
-        let (buffer, data) = host.upload_buffer(BLOCK)?;
-        crate::host::name(&buffer, || "staging of textures (a block)".into());
-        Some(Upload(buffer, data))
-    })?;
+        pool.take(bytes, 512, now(), || {
+            // (`VICTORY_RESIDENCY=1`: no new block for a texture picked by index
+            // while commit is short; those a draw samples now still get one.)
+            let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
+            if speculative && !crate::residency::allow_staging_growth(false) {
+                return None;
+            }
+            let (buffer, data) = host.upload_buffer(BLOCK)?;
+            crate::host::name(&buffer, || "staging of textures (a block)".into());
+            Some(Upload(buffer, data))
+        })
+    };
+    let (piece, memory, again) = taken?;
     let owned = StagingPiece(piece);
     // SAFETY: the piece lies in the block's mapping.
     let data = unsafe { memory.1.add(piece.start as usize) };
@@ -1015,6 +1079,23 @@ mod tests {
         assert!(!r.whole(1024));
         r.give(100, 28);
         assert!(r.whole(1024));
+    }
+
+    /// (Fox F, memory audit item 1; from Op-lite/victory-scarlett c45b43e)
+    /// A pool's own rest (`VICTORY_STAGING_REST_MS` is read into it): a piece
+    /// given back is used again after it, not after [`REST`].
+    #[test]
+    fn a_pool_may_rest_shorter_than_the_default() {
+        let mut pool: Pool<u32> = Pool::new(SPARE);
+        pool.rest = 100;
+        let make = || Some(0u32);
+        let (a, _, _) = pool.take(1024, 512, 0, make).unwrap();
+        pool.give(a, 0);
+        // Not before its own rest (another block is made), at once after it.
+        let (p, _, _) = pool.take(1024, 512, 99, make).unwrap();
+        assert_ne!((p.block, p.start), (a.block, a.start));
+        let (q, _, again) = pool.take(1024, 512, 100, make).unwrap();
+        assert_eq!((q.block, q.start, again), (a.block, a.start, true));
     }
 
     #[test]
