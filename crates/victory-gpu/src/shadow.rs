@@ -449,15 +449,81 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
 ///
 /// A window goes to the card while there is room under this number and
 /// while a fifth of the card's budget is free, as title buffers do
-/// (`card_for`): textures keep their room, and once they have filled the
-/// card later windows stay where they are. The CPU's side stays in the PC's
-/// memory, so the memory shared with the card does not shrink by this
-/// alone; what moves is what shaders read.
+/// (`card_for`; the share is [`window_card_percent`]): textures keep their
+/// room, and once they have filled the card later windows stay where they
+/// are. The CPU's side stays in the PC's memory, so the memory shared with
+/// the card does not shrink by this alone; what moves is what shaders read.
 fn window_card_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
         std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
     })
+}
+
+/// The share of the card's budget, in percent, up to which a new window
+/// outside buffers gets a copy in the card's memory ([`window_room_for`],
+/// [`window_mapped_for`]): `VICTORY_WINDOW_CARD_PERCENT`, 50 to 95; 80
+/// unless set, the fifth kept free before.
+///
+/// Taken from codec-d/cool_fox 30e54b4 (Neptune-VE). Above the share the
+/// window keeps its copy in the PC's memory that the card shares; below it a
+/// card that has filled up leaves new windows on the bus. In their run
+/// nep-chk1 the card passed 80 % after 400 s of walking, textures took the
+/// room the windows let go, and the windows' copies in the PC's memory grew
+/// from 4 MB to 2,764 MB in three minutes, the process's private memory from
+/// 29 to 35 GB: a card over its budget gets no help from a higher share,
+/// and a card under it wants windows in card memory.
+fn window_card_percent() -> u64 {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| window_card_percent_of(std::env::var("VICTORY_WINDOW_CARD_PERCENT").ok().as_deref()))
+}
+
+/// [`window_card_percent`] for the switch's value: a whole number, clamped
+/// to 50 to 95; 80 when it is unset or not a number.
+fn window_card_percent_of(value: Option<&str>) -> u64 {
+    value.and_then(|v| v.trim().parse::<u64>().ok()).map_or(80, |percent| percent.clamp(50, 95))
+}
+
+/// The bytes of the card's `budget` up to which windows get a copy in its
+/// memory, at `percent` ([`window_card_percent`]). Tenths first, so that 80
+/// gives exactly the `budget / 10 * 8` the line was before the switch.
+fn window_card_line(budget: u64, percent: u64) -> u64 {
+    u64::try_from(u128::from(budget / 10) * u128::from(percent) / 10).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod window_card_tests {
+    use super::{window_card_line, window_card_percent_of};
+
+    /// The switch is read as a percentage between 50 and 95, and anything
+    /// else leaves the line where it was.
+    #[test]
+    fn the_window_share_is_read_and_clamped() {
+        for unread in [None, Some(""), Some("eighty"), Some("-10"), Some("85%"), Some("8.5")] {
+            assert_eq!(window_card_percent_of(unread), 80, "{unread:?}");
+        }
+        assert_eq!(window_card_percent_of(Some("90")), 90);
+        assert_eq!(window_card_percent_of(Some(" 65 ")), 65);
+        assert_eq!(window_card_percent_of(Some("0")), 50);
+        assert_eq!(window_card_percent_of(Some("49")), 50);
+        assert_eq!(window_card_percent_of(Some("96")), 95);
+        assert_eq!(window_card_percent_of(Some("1000")), 95);
+    }
+
+    /// At 80 the line is the old `budget / 10 * 8` to the byte; other shares
+    /// move it as asked.
+    #[test]
+    fn the_default_share_keeps_the_old_line() {
+        for budget in [0, 9, 10, 99, 12_345, 22_000_000_000, 24 << 30, (24 << 30) + 7, u64::MAX / 10, u64::MAX] {
+            assert_eq!(window_card_line(budget, 80), budget / 10 * 8, "{budget}");
+        }
+        for budget in [20u64 << 30, u64::MAX] {
+            assert_eq!(window_card_line(budget, 50), budget / 10 * 5);
+            assert_eq!(window_card_line(budget, 90), budget / 10 * 9);
+            assert!(window_card_line(budget, 95) > window_card_line(budget, 90));
+            assert!(window_card_line(budget, 95) < budget);
+        }
+    }
 }
 
 /// Bytes alive of windows' card sides ([`window_card_most`]).
@@ -510,7 +576,7 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     }
     let host = host()?;
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > window_card_line(budget, window_card_percent())
     {
         return None;
     }
@@ -546,7 +612,7 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > window_card_line(budget, window_card_percent())
     {
         return None;
     }
