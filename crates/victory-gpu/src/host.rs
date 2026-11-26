@@ -2617,6 +2617,18 @@ struct Sent {
     writes: Vec<(usize, crate::queue::Written, usize)>,
 }
 
+/// What the split's other thread is to do for a submission the first
+/// prepared and sent ([`crate::queue::behind`], `VICTORY_SUBMIT_SPLIT=1`).
+pub(crate) enum Prepared {
+    /// Nothing to wait for: tell whoever waits for the line.
+    InAir,
+    /// Wait until there are fewer flights in the air ([`relay_exact`]).
+    Room,
+    /// Wait for the flight to be landed, or settled under the submission
+    /// lock, counted as a settle for `why` ([`WHY_WRITES`] and the rest).
+    Wait(usize),
+}
+
 /// A submission on the card that has not been waited for ([`late`]): its
 /// host lists, taken from the title's (which it may reset meanwhile), and
 /// what is to be done once it has run.
@@ -5251,6 +5263,105 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
+        let _landing = crate::timeline::span("landed lists reset and given back");
+        land();
+    }
+
+    /// The first half of [`Host::execute_late`] for the split's two threads
+    /// ([`crate::queue::behind`], `VICTORY_SUBMIT_SPLIT=1`): the lists are
+    /// prepared and sent, their flight put in the line, and what is left
+    /// (to wait for, and to give the landed lists back) comes back for the
+    /// other thread ([`Host::send_prepared`]). `None`: done all the same on
+    /// this thread (no lists, or a cut, which the split does not take apart).
+    pub(crate) fn prepare_late(
+        &self,
+        lists: Vec<crate::list::Detached>,
+        order: Vec<usize>,
+        parts: &[usize],
+    ) -> Option<Prepared> {
+        if order.is_empty() {
+            crate::list::recycle(lists, &order);
+            return None;
+        }
+        late_threads();
+        if let Some(_) = {
+            let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
+            card_steps::cut_for(&runs)
+        } {
+            // Not split: a cut is rare, and its parts depend on each other.
+            self.execute_parts(lists, order, parts);
+            return None;
+        }
+        let (fence, sent) = {
+            let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
+            let (submitted, sent) = self.submit(&runs, parts, true)?;
+            let fence = *submitted;
+            drop(submitted);
+            (fence, sent)
+        };
+        // The flight joins the line here, before the next submission is
+        // prepared: its writes are what the next prepare must see
+        // ([`late_blocked`]).
+        let told = !sent.writes.is_empty();
+        let sizes = crate::memory::asked_sizes(order.iter().map(|&i| lists[i].host()));
+        let most = {
+            let mut line = line();
+            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            join_ranges(
+                written,
+                sent.back
+                    .iter()
+                    .flat_map(|(_, ranges)| ranges.iter().copied())
+                    .chain(sent.texture_back_ranges.iter().copied()),
+            );
+            *flying += order.len();
+            *target = fence;
+            items.push(Late::Run(Flight {
+                number: sent.number,
+                fence,
+                lists,
+                order,
+                card: sent.card,
+                back: sent.back,
+                own: sent.own,
+                texture_back_ranges: sent.texture_back_ranges,
+            }));
+            items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
+            *flying >= late_most()
+        };
+        LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
+        RELAY_MOVED.notify_one();
+        let prepared = if told && !late_writes() {
+            Prepared::Wait(WHY_WRITES)
+        } else if sizes {
+            Prepared::Wait(WHY_READ)
+        } else if most && relay_exact() {
+            Prepared::Room
+        } else if most {
+            Prepared::Wait(WHY_MOST)
+        } else {
+            Prepared::InAir
+        };
+        Some(prepared)
+    }
+
+    /// The second half: wait for the flight the other thread prepared (or
+    /// for the thread that settles it), and give the landed lists back.
+    pub(crate) fn send_prepared(&self, prepared: Prepared) {
+        match prepared {
+            Prepared::InAir => LINE_MOVED.notify_one(),
+            Prepared::Room => relay_wait(WHY_MOST, |line| line.lists < late_most()),
+            Prepared::Wait(why) => {
+                if relay() {
+                    // The relay thread lands the flights; no submission
+                    // lock here, so the thread that prepares goes on.
+                    relay_wait(why, |line| line.line.is_empty() && !line.settling);
+                } else {
+                    let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+                    self.settle(&mut submitted, why);
+                }
+            }
+        }
         let _landing = crate::timeline::span("landed lists reset and given back");
         land();
     }
