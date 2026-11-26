@@ -30,6 +30,7 @@ enum TypeDef {
     Void,
     Int(u32),
     Float,
+    /// A 64-bit float.
     Double,
     /// Pointee and address space.
     Ptr(Ty, u32),
@@ -108,6 +109,7 @@ pub(crate) enum Cast {
     FpToSi = 4,
     UiToFp = 5,
     SiToFp = 6,
+    FpExt = 8,
     Bitcast = 11,
 }
 
