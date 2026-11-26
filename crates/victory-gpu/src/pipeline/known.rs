@@ -324,8 +324,22 @@ pub fn make_pending(bytes: &[u8]) -> bool {
         };
         Some(Box::new(g))
     };
-    HostPipeline::new(&shaders, graphics.as_deref(), &spec_constants).is_some()
+    // The run's driver-crash fallback for one of the shaders, if it is being
+    // checked: made as the run will make it.
+    let fallback = std::env::var(PENDING_FALLBACK).ok();
+    let fallback = fallback.as_deref().and_then(|v| v.split_once(' '));
+    HostPipeline::new_with(&shaders, graphics.as_deref(), &spec_constants, fallback).is_some()
 }
+
+/// What a canary child ([`make_pending`]) is given its pipeline's
+/// driver-crash fallback in: `<shader hash> <mnemonic>`, that shader
+/// translated with the mnemonic lowered as a no-op, as the run makes it
+/// ([`HostPipeline::new_with`]). `VICTORY_DISABLE_MNEMONIC` does not do it:
+/// the run's translation takes its disabled set as an argument and reads no
+/// environment, and the shader cache would serve the normal translation the
+/// run cached; so the fallback's own check crashed like the original (run
+/// combined-run4, compute f16876929fa64f9f).
+pub(crate) const PENDING_FALLBACK: &str = "VICTORY_PENDING_FALLBACK";
 
 /// Reads the specialization constants [`pending`] wrote and the bytes that
 /// follow them.

@@ -92,7 +92,17 @@ impl Pending {
         self.made.get_or_init(|| {
             let began = Instant::now();
             let made = if isolate() {
-                isolated_make(&self.shaders, self.graphics.as_deref(), &self.spec_constants)
+                isolated_make(&self.key, &self.shaders, self.graphics.as_deref(), &self.spec_constants)
+            } else if let Some((hash, mnemonic)) = fallback_for(&self.shaders) {
+                // A shader the bisect found crashing this driver: made with
+                // its cached fallback here too, not only behind a canary.
+                tracing::info!(shaders = ?self.shaders, %mnemonic, "host pipeline made with the cached fallback (not isolated)");
+                HostPipeline::new_with(
+                    &self.shaders,
+                    self.graphics.as_deref(),
+                    &self.spec_constants,
+                    Some((hash.as_str(), mnemonic)),
+                )
             } else {
                 HostPipeline::new(&self.shaders, self.graphics.as_deref(), &self.spec_constants)
             };
@@ -116,16 +126,29 @@ fn isolate() -> bool {
 }
 
 /// Makes the host pipeline through a child process ([`isolate`]); `None` if
-/// the child refused or died. A child that died costs this one pipeline,
+/// the child died. A child that died costs this one pipeline,
 /// unless the translate path's bisect has cached a mnemonic whose disabling
 /// lets the driver compile it: then the pipeline is made with that fallback.
+/// A pipeline [`proven`] before is made at once, without a child.
 fn isolated_make(
+    key: &str,
     shaders: &[Arc<Shader>],
     graphics: Option<&GraphicsState>,
     spec_constants: &SpecConstants,
 ) -> Option<HostPipeline> {
+    // (The key does not cover specialization constants: only the plain
+    // pipeline is taken as proven.)
+    let plain = spec_constants.is_empty();
+    if plain && proven(key) {
+        PROVEN_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        return HostPipeline::new(shaders, graphics, spec_constants);
+    }
     let bytes = super::known::pending(shaders, graphics, spec_constants);
-    if !canary(&bytes, None) {
+    if canary(&bytes, None) {
+        if plain {
+            note_proven(key);
+        }
+    } else {
         let Some((hash, mnemonic)) = fallback_for(shaders) else {
             tracing::warn!(
                 ?shaders,
@@ -136,7 +159,7 @@ fn isolated_make(
         // The fallback is re-checked in a child first: a wrong or stale
         // mnemonic must cost a child, not the run (the driver's crash is
         // deterministic, so this child's survival means the fallback works).
-        if !canary(&bytes, Some(mnemonic)) {
+        if !canary(&bytes, Some((hash.as_str(), mnemonic))) {
             tracing::warn!(
                 ?shaders,
                 "no host pipeline: the driver crashed compiling it even with the cached fallback"
@@ -154,6 +177,58 @@ fn isolated_make(
         );
     }
     HostPipeline::new(shaders, graphics, spec_constants)
+}
+
+/// Pipelines made without a child because they were [`proven`], since the
+/// start (for the log's canary line).
+static PROVEN_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// `warm-done.txt` in the pipeline cache folder: `<fingerprint> <key>` for
+/// each pipeline made in a child process without a crash, by `victory warm`
+/// or by a run's canary, with the translator and driver of
+/// [`super::known::fingerprint`].
+fn proven_file() -> Option<std::path::PathBuf> {
+    super::library::folder().map(|dir| dir.join("warm-done.txt"))
+}
+
+/// This run's translator and driver, as `warm-done.txt` names them.
+fn fingerprint() -> &'static str {
+    static FINGERPRINT: OnceLock<String> = OnceLock::new();
+    FINGERPRINT.get_or_init(super::known::fingerprint)
+}
+
+/// Whether `key` was made in a child process before, with this translator
+/// and driver: its compile does not crash (the driver's crash is
+/// deterministic), so it needs no canary. `victory warm` ahead of a run, and
+/// each canary that made its pipeline, add to the list; a new translator or
+/// driver starts it again.
+fn proven(key: &str) -> bool {
+    static PROVEN: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    PROVEN
+        .get_or_init(|| {
+            let of = fingerprint();
+            let text = proven_file().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
+            let set: std::collections::HashSet<String> = text
+                .lines()
+                .filter_map(|l| l.split_once(' '))
+                .filter(|(f, _)| *f == of)
+                .map(|(_, k)| k.trim().to_owned())
+                .collect();
+            tracing::info!(pipelines = set.len(), fingerprint = of, "pipelines proven in a child before: made without a canary");
+            set
+        })
+        .contains(key)
+}
+
+/// Adds `key` to [`proven_file`] for later runs.
+fn note_proven(key: &str) {
+    use std::io::Write;
+    static FILE: Mutex<()> = Mutex::new(());
+    let Some(path) = proven_file() else { return };
+    let _held = FILE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{} {key}", fingerprint());
+    }
 }
 
 /// The fallback cache written by the translate path's bisect, loaded once:
@@ -208,11 +283,88 @@ fn fallback_for(shaders: &[Arc<Shader>]) -> Option<(String, &'static str)> {
     })
 }
 
-/// Has a child process make the serialised pipeline; whether it was made (a
-/// child that died, e.g. a driver crash, is "no"). With `disabled`, the named
-/// mnemonic is lowered as a no-op in the child, as the translate path's
-/// bisect does. The child runs at idle priority, like [`workers`] do.
-fn canary(bytes: &[u8], disabled: Option<&str>) -> bool {
+/// How a canary child ended.
+enum Ended {
+    Made,
+    /// Exit code 1: the pipeline refused, or the child had no host device.
+    Refused,
+    /// Any other end (a driver crash is an exception code), or not started.
+    Died(Option<i32>),
+}
+
+/// Canary children at once (`VICTORY_CANARY_JOBS`, default 16). Each opens a
+/// D3D12 device of its own, and many at once can lose theirs: started 36 at
+/// once, 28 exited 1 with "The GPU device instance has been suspended"
+/// (0x887A0005; an offline bisect of run-keep's crashes). At 4
+/// the canaries could not keep up: 1,500 draws a frame waited for theirs five
+/// minutes into the world (run combined-run2).
+fn canary_jobs() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_CANARY_JOBS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16).max(1)
+    })
+}
+
+/// Canary children running, and signalled when one ends.
+static CANARIES: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+/// Canary outcomes since the start: made, refused (exit 1), died.
+static CANARY_COUNTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Has a child process make the serialised pipeline; whether the run may make
+/// it too: "no" only if the child died (a driver crash ends it with an
+/// exception code, such as 0xc0000005). A child that exits 1 refused it
+/// without a crash, and the child refuses some pipelines the run makes: 251
+/// in run combined-run2, refused again on a retry alone, while runs without
+/// isolation drew with every one of them. Taken for crashes, those were left
+/// out for the rest of the run and the world was not drawn. With `fallback`
+/// (`(shader hash, mnemonic)`), the child makes the pipeline with that
+/// shader's mnemonic lowered as a no-op, as the run would.
+fn canary(bytes: &[u8], fallback: Option<(&str, &str)>) -> bool {
+    let ended = canary_once(bytes, fallback);
+    let at = match &ended {
+        Ended::Made => 0,
+        Ended::Refused => 1,
+        Ended::Died(code) => {
+            tracing::info!(code = ?code.map(|c| format!("{:#010x}", c as u32)), "a pipeline canary child died");
+            2
+        }
+    };
+    let n = CANARY_COUNTS[at].fetch_add(1, Ordering::Relaxed) + 1;
+    let total: u64 = CANARY_COUNTS.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+    if n == 1 || total % 100 == 0 {
+        let [made, refused, dead] = CANARY_COUNTS.each_ref().map(|c| c.load(Ordering::Relaxed));
+        tracing::info!(
+            made,
+            refused_in_child = refused,
+            died = dead,
+            proven_before = PROVEN_SKIPPED.load(Ordering::Relaxed),
+            at_once = canary_jobs(),
+            "pipeline canaries since the start (VICTORY_CANARY_JOBS)"
+        );
+    }
+    !matches!(ended, Ended::Died(_))
+}
+
+/// One canary child, when fewer than [`canary_jobs`] run. The child runs at
+/// idle priority, like [`workers`] do.
+fn canary_once(bytes: &[u8], fallback: Option<(&str, &str)>) -> Ended {
+    {
+        let (count, ended) = &CANARIES;
+        let mut n = count.lock().unwrap_or_else(|e| e.into_inner());
+        while *n >= canary_jobs() {
+            n = ended.wait(n).unwrap_or_else(|e| e.into_inner());
+        }
+        *n += 1;
+    }
+    let made = canary_child(bytes, fallback);
+    let (count, ended) = &CANARIES;
+    *count.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+    ended.notify_one();
+    made
+}
+
+fn canary_child(bytes: &[u8], fallback: Option<(&str, &str)>) -> Ended {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -227,7 +379,7 @@ fn canary(bytes: &[u8], disabled: Option<&str>) -> bool {
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     if std::fs::write(&file, bytes).is_err() {
-        return false;
+        return Ended::Died(None);
     }
     let made = std::env::current_exe()
         .ok()
@@ -239,13 +391,17 @@ fn canary(bytes: &[u8], disabled: Option<&str>) -> bool {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .creation_flags(IDLE_PRIORITY_CLASS);
-            if let Some(mnemonic) = disabled {
-                cmd.env("VICTORY_DISABLE_MNEMONIC", mnemonic);
+            if let Some((hash, mnemonic)) = fallback {
+                cmd.env(super::known::PENDING_FALLBACK, format!("{hash} {mnemonic}"));
             }
             cmd.spawn().ok()
         })
-        .and_then(|mut child| child.wait().ok().map(|s| s.success()))
-        .unwrap_or(false);
+        .and_then(|mut child| child.wait().ok())
+        .map_or(Ended::Died(None), |s| match s.code() {
+            _ if s.success() => Ended::Made,
+            Some(1) => Ended::Refused,
+            code => Ended::Died(code),
+        });
     let _ = std::fs::remove_file(&file);
     made
 }
