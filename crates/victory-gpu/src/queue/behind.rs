@@ -435,8 +435,31 @@ impl Work for Job {
         let Job::Lists(queue, recordings) = self else {
             return vec![self];
         };
-        let lists: Vec<This> = recordings.iter().map(|r| r.back()).collect();
-        let jobs = jobs_of(queue as This, &lists);
+        // With `VICTORY_LIST_RELEASE`, each recording's list is taken for this
+        // submission: it is given back once the card has run it, and a
+        // recording named again (its list submitted closed again) gets a
+        // fresh list. Named twice here it runs its list twice, as before.
+        let release = crate::list::thin::release();
+        let lists: Vec<This> = if release {
+            let mut seen: Vec<(usize, This)> = Vec::new();
+            recordings
+                .iter()
+                .map(|r| {
+                    let at = std::sync::Arc::as_ptr(r) as usize;
+                    match seen.iter().find(|(p, _)| *p == at) {
+                        Some(&(_, back)) => back,
+                        None => {
+                            let back = r.take_back();
+                            seen.push((at, back));
+                            back
+                        }
+                    }
+                })
+                .collect()
+        } else {
+            recordings.iter().map(|r| r.back()).collect()
+        };
+        let jobs = jobs_of(queue as This, &lists, release);
         // It stood for one submission not begun.
         let runs = jobs.iter().filter(|j| j.runs()).count() as u64;
         QUEUED.fetch_add(runs, Relaxed);
@@ -878,7 +901,7 @@ pub(super) fn submit(this: This, lists: &[This]) {
         room(before + 1);
         return;
     }
-    let jobs = jobs_of(this, lists);
+    let jobs = jobs_of(this, lists, false);
     let runs = jobs.iter().filter(|j| j.runs()).count() as u64;
     let before = QUEUED.fetch_add(runs, Relaxed);
     STATS[RUNS].fetch_add(runs, Relaxed);
@@ -898,8 +921,10 @@ fn room(queued: u64) {
     }
 }
 
-/// What a submission of `lists` is in the line.
-fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
+/// What a submission of `lists` is in the line. `release`: the lists are a
+/// thin recording's, whose list of ours is given back once it has run
+/// ([`crate::list::thin`], `VICTORY_LIST_RELEASE=1`).
+fn jobs_of(this: This, lists: &[This], release: bool) -> Vec<Job> {
     let queue = this as usize;
     // In one piece up to the first list that waits for a memory value, as
     // `super::submit_cut` runs them; the rest part by part.
@@ -920,11 +945,11 @@ fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
     });
     let mut jobs: Vec<Job> = Vec::new();
     if first > 0 {
-        let (taken, order) = crate::list::detach(&lists[..first]);
+        let (taken, order) = crate::list::detach(&lists[..first], release);
         jobs.push(Job::Run(queue, taken, order));
     }
     if first < lists.len() {
-        for (waits, taken, order) in crate::list::detach_parts(&lists[first..]) {
+        for (waits, taken, order) in crate::list::detach_parts(&lists[first..], release) {
             jobs.extend(waits.into_iter().map(Job::Value));
             jobs.push(Job::Run(queue, taken, order));
         }
