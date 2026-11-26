@@ -59,6 +59,22 @@ struct Global {
     init: Option<u32>,
 }
 
+/// A specialization constant declared in the module: an internal constant
+/// global whose initialiser [`crate::emit::HostShader::specialize`] patches
+/// in the finished bitcode before the container is re-signed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Spec {
+    pub id: u32,
+    /// The initialiser is an `f32` (else an `i32`).
+    pub float: bool,
+    /// The default value's raw 32 bits (IEEE-754 for `float`).
+    pub value: u32,
+    /// Bit offset of the VBR-encoded value within the written bitcode.
+    pub offset: u32,
+    /// Index into `consts` of the initialiser.
+    init: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Const {
     Int(i64),
@@ -226,6 +242,8 @@ pub(crate) struct Module {
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
     tags: HashMap<u32, Tag>,
+    /// Specialization constants, in declaration order.
+    specs: Vec<Spec>,
 }
 
 impl Module {
@@ -373,6 +391,32 @@ impl Module {
         if let V::Global(n) = g {
             self.globals[n as usize].init = Some(i);
         }
+        g
+    }
+
+    /// A specialization constant: an internal constant global `spec.const.<id>`
+    /// whose initialiser is `value`'s raw 32 bits. `float` makes it an `f32`
+    /// (else an `i32`). [`Module::write_with_specs`] reports where its value
+    /// sits in the bitcode so it can be patched before the container is
+    /// re-signed.
+    pub fn spec_constant(&mut self, id: u32, value: u32, float: bool) -> V {
+        let init = if float {
+            self.f32(value)
+        } else {
+            let i32t = self.int(32);
+            self.constant(i32t, Const::Int(i64::from(value as i32)))
+        };
+        let V::Const(i) = init else {
+            unreachable!("a scalar constant")
+        };
+        let g = self.constant_global(&format!("spec.const.{id}"), init);
+        self.specs.push(Spec {
+            id,
+            float,
+            value,
+            offset: 0,
+            init: i,
+        });
         g
     }
 
@@ -550,6 +594,17 @@ impl Module {
     }
 
     pub fn write(&self) -> Vec<u8> {
+        self.write_with_specs().0
+    }
+
+    /// The module as bitcode, plus its specialization constants with the bit
+    /// offset of each one's value (see [`Module::spec_constant`]).
+    pub fn write_with_specs(&self) -> (Vec<u8>, Vec<Spec>) {
+        let mut specs = self.specs.clone();
+        let mut by_const: HashMap<u32, usize> = HashMap::new();
+        for (n, spec) in self.specs.iter().enumerate() {
+            by_const.insert(spec.init, n);
+        }
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");
         w.enter(MODULE_BLOCK, 3);
@@ -665,15 +720,31 @@ impl Module {
         let const_id = |i: u32| u64::from(funcs + i);
         w.enter(CONSTANTS_BLOCK, 4);
         let mut current = None;
-        for (ty, c) in &self.consts {
+        for (ci, (ty, c)) in self.consts.iter().enumerate() {
             if current != Some(*ty) {
                 w.record(1, &[u64::from(ty.0)]);
                 current = Some(*ty);
             }
             match c {
                 Const::Undef => w.record(3, &[]),
-                Const::Int(v) => w.record(4, &[signed(*v)]),
-                Const::Float(bits) => w.record(6, &[u64::from(*bits)]),
+                Const::Int(v) => {
+                    let value = signed(*v);
+                    if let Some(&n) = by_const.get(&(ci as u32)) {
+                        specs[n].offset = (w.bit_pos() + 16) as u32;
+                        w.record_fixed(4, value, SPEC_CHUNKS);
+                    } else {
+                        w.record(4, &[value]);
+                    }
+                }
+                Const::Float(bits) => {
+                    let value = u64::from(*bits);
+                    if let Some(&n) = by_const.get(&(ci as u32)) {
+                        specs[n].offset = (w.bit_pos() + 16) as u32;
+                        w.record_fixed(6, value, SPEC_CHUNKS);
+                    } else {
+                        w.record(6, &[value]);
+                    }
+                }
                 Const::Aggregate(ids) => {
                     let r: Vec<u64> = ids.iter().map(|&i| const_id(i)).collect();
                     w.record(7, &r);
@@ -893,9 +964,13 @@ impl Module {
         }
         w.exit();
         w.exit();
-        w.finish()
+        (w.finish(), specs)
     }
 }
+
+/// Chunks of a specialization constant's fixed-width VBR value: 7 × 5 value
+/// bits hold any 32-bit `i32`/`u32`/`f32` pattern.
+const SPEC_CHUNKS: u32 = 7;
 
 const MODULE_BLOCK: u64 = 8;
 const PARAMATTR_BLOCK: u64 = 9;
@@ -997,6 +1072,24 @@ impl Writer {
         self.emit(v, width);
     }
 
+    /// The bit offset of the next bit to be written, in the finished stream.
+    fn bit_pos(&self) -> usize {
+        self.words.len() * 32 + self.bits as usize
+    }
+
+    /// [`Writer::vbr`] in exactly `chunks` chunks: a specialization
+    /// constant's value is always this wide, so patching one never moves the
+    /// bits after it.
+    fn vbr_fixed(&mut self, mut v: u64, width: u32, chunks: u32) {
+        let hi = 1u64 << (width - 1);
+        for i in 0..chunks {
+            let cont = if i + 1 < chunks { hi } else { 0 };
+            self.emit(v & (hi - 1) | cont, width);
+            v >>= width - 1;
+        }
+        debug_assert_eq!(v, 0);
+    }
+
     fn align(&mut self) {
         if self.bits > 0 {
             self.words.push(self.cur as u32);
@@ -1035,6 +1128,16 @@ impl Writer {
         for &o in ops {
             self.vbr(o, 6);
         }
+    }
+
+    /// An unabbreviated record of one operand written in a fixed number of
+    /// VBR chunks (the operand value starts 16 bits in: 4 for the record
+    /// code plus 6 each for the record number and the operand count).
+    fn record_fixed(&mut self, code: u64, value: u64, chunks: u32) {
+        self.emit(3, self.width());
+        self.vbr(code, 6);
+        self.vbr(1, 6);
+        self.vbr_fixed(value, 6, chunks);
     }
 
     fn finish(mut self) -> Vec<u8> {

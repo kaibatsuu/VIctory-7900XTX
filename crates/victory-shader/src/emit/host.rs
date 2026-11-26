@@ -633,13 +633,14 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         })
         .collect();
     s.m.terminate(b, Term::Ret);
+    let (dxil, spec_constants) = s.finish();
     HostShader {
         stage: if pixel {
             crate::native::HwStage::Ps
         } else {
             crate::native::HwStage::Vs
         },
-        dxil: s.finish(),
+        dxil,
         user_data: Vec::new(),
         samplers: Vec::new(),
         static_samplers: Vec::new(),
@@ -647,6 +648,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
         root_indexed_views: Vec::new(),
+        spec_constants,
     }
 }
 

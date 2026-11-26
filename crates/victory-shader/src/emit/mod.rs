@@ -353,7 +353,7 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
 }
 
 /// A translated shader and what the host binds for it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HostShader {
     pub stage: HwStage,
     /// The DXIL container, hashed as D3D12 expects.
@@ -376,6 +376,9 @@ pub struct HostShader {
     pub root_uavs: Vec<u8>,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
+    /// Specialization constants the shader declares, with where their values
+    /// sit in [`HostShader::dxil`] ([`HostShader::specialize`] patches them).
+    pub spec_constants: Vec<SpecConstant>,
 }
 
 impl HostShader {
@@ -390,6 +393,126 @@ impl HostShader {
             .unwrap_or(0);
         n.next_multiple_of(4)
     }
+
+    /// The DXIL container with `values` patched into this shader's
+    /// specialization constants and the container re-signed, so D3D12 sees
+    /// them as the shader's constants. A declared constant absent from
+    /// `values` keeps its default; a value for an undeclared id is ignored.
+    /// With no declared constants this is the unchanged container.
+    pub fn specialize(&self, values: &SpecConstants) -> Result<Vec<u8>, ShaderError> {
+        if self.spec_constants.is_empty() {
+            return Ok(self.dxil.clone());
+        }
+        let mut out = self.dxil.clone();
+        let bitcode_bit = spec_bitcode_bit(&out)?;
+        for spec in &self.spec_constants {
+            let value = values.get(&spec.id).copied().unwrap_or(spec.default);
+            let bit = bitcode_bit + spec.offset_bits as usize;
+            write_spec_value(&mut out, bit, value);
+        }
+        let digest = container::hash(&out[20..]);
+        out[4..20].copy_from_slice(&digest);
+        Ok(out)
+    }
+}
+
+/// A value for one specialization constant.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SpecValue {
+    U32(u32),
+    I32(i32),
+    F32(f32),
+}
+
+/// Specialization constant values by id.
+pub type SpecConstants = std::collections::BTreeMap<u32, SpecValue>;
+
+/// A specialization constant a translated shader declares: its id, the
+/// default the shader was emitted with, and where its value sits in the
+/// emitted DXIL bitcode.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpecConstant {
+    pub id: u32,
+    pub default: SpecValue,
+    /// Bit offset of the value within the DXIL part's bitcode.
+    pub offset_bits: u32,
+}
+
+/// The bit offset, in the whole container, of the DXIL part's bitcode.
+fn spec_bitcode_bit(container: &[u8]) -> Result<usize, ShaderError> {
+    if container.get(0..4) != Some(b"DXBC") || container.len() < 32 {
+        return Err(ShaderError::Malformed("not a DXBC container"));
+    }
+    let chunks = u32::from_le_bytes(container[28..32].try_into().unwrap()) as usize;
+    let table = 32usize.checked_add(chunks.checked_mul(4).ok_or(ShaderError::Malformed(
+        "container chunk table too large",
+    ))?);
+    let table = table.ok_or(ShaderError::Malformed("container chunk table too large"))?;
+    if container.len() < table {
+        return Err(ShaderError::Malformed("truncated container chunk table"));
+    }
+    for at in (32..table).step_by(4) {
+        let offset = u32::from_le_bytes(container[at..at + 4].try_into().unwrap()) as usize;
+        let head = container
+            .get(offset..offset + 8)
+            .ok_or(ShaderError::Malformed("chunk out of bounds"))?;
+        let fourcc = &head[0..4];
+        let size = u32::from_le_bytes(head[4..8].try_into().unwrap()) as usize;
+        if fourcc == b"DXIL" {
+            let part = container
+                .get(offset + 8..offset + 8 + size)
+                .ok_or(ShaderError::Malformed("DXIL part out of bounds"))?;
+            let bitcode_offset =
+                u32::from_le_bytes(part[16..20].try_into().unwrap()) as usize;
+            let start = 8 + bitcode_offset;
+            if part.get(start..start + 4) != Some(b"BC\xC0\xDE") {
+                return Err(ShaderError::Malformed("bitcode lacks LLVM magic"));
+            }
+            return Ok((offset + 8 + start) * 8);
+        }
+    }
+    Err(ShaderError::Malformed("no DXIL part"))
+}
+
+/// Encodes `value` as the fixed-width VBR operand its global's initialiser
+/// was written as (see `bitcode::SPEC_CHUNKS`).
+fn spec_encoded(value: SpecValue) -> u64 {
+    match value {
+        SpecValue::F32(f) => u64::from(f.to_bits()),
+        SpecValue::U32(v) => signed(v as i32 as i64),
+        SpecValue::I32(v) => signed(v as i64),
+    }
+}
+
+/// LLVM's signed VBR operand (see `bitcode`): magnitude shifted left, sign
+/// in bit 0.
+fn signed(v: i64) -> u64 {
+    if v >= 0 {
+        (v as u64) << 1
+    } else {
+        (v.unsigned_abs() << 1) | 1
+    }
+}
+
+/// Overwrites a fixed-width specialization-constant value (7 VBR6 chunks) at
+/// `bit` in `container`.
+fn write_spec_value(container: &mut [u8], bit: usize, value: SpecValue) {
+    const CHUNKS: usize = 7;
+    let mut v = spec_encoded(value);
+    for i in 0..CHUNKS {
+        let chunk = (v & 0x1f) | if i + 1 < CHUNKS { 0x20 } else { 0 };
+        for b in 0..6 {
+            let pos = bit + i * 6 + b;
+            let mask = 1 << (pos % 8);
+            if chunk >> b & 1 != 0 {
+                container[pos / 8] |= mask;
+            } else {
+                container[pos / 8] &= !mask;
+            }
+        }
+        v >>= 5;
+    }
+    debug_assert_eq!(v, 0);
 }
 
 /// One dword of user data and the root parameter that fills it.
@@ -826,6 +949,7 @@ fn emit_program(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
+        spec_constants: l.spec_constants,
     };
     Ok((shader, wave_size))
 }
@@ -1014,6 +1138,52 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// A compute shader with two specialization constants specialises into
+    /// a re-signed container whose constants hold the given values.
+    #[test]
+    fn specialization_constants_are_patched_and_resigned() {
+        let mut s = super::shader::Shader::new(false);
+        s.threads = Some([1, 1, 1]);
+        s.spec_constant(0, super::SpecValue::U32(7));
+        s.spec_constant(3, super::SpecValue::F32(1.5));
+        s.m.terminate(s.entry, super::bitcode::Term::Ret);
+        let (dxil, specs) = s.finish();
+        assert_eq!(specs.len(), 2);
+        assert_eq!((specs[0].id, specs[1].id), (0, 3));
+
+        let shader = super::HostShader {
+            stage: crate::HwStage::Cs,
+            dxil,
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            root_indexed_views: Vec::new(),
+            spec_constants: specs,
+        };
+
+        let values: super::SpecConstants = [
+            (0, super::SpecValue::U32(99)),
+            (3, super::SpecValue::F32(2.25)),
+        ]
+        .into_iter()
+        .collect();
+        let specialized = shader.specialize(&values).unwrap();
+
+        // The patched container is re-signed, and no longer the default.
+        assert_eq!(&specialized[4..20], &super::container::hash(&specialized[20..]));
+        assert_ne!(specialized, shader.dxil);
+        // Specialising again with the same values is stable.
+        assert_eq!(shader.specialize(&values).unwrap(), specialized);
+        // A declared constant with no value keeps its default.
+        let only_id_0: super::SpecConstants = [(0, super::SpecValue::U32(99))].into_iter().collect();
+        let kept = shader.specialize(&only_id_0).unwrap();
+        assert_ne!(kept, specialized);
+        assert_eq!(&kept[4..20], &super::container::hash(&kept[20..]));
     }
 
     #[cfg(windows)]
@@ -1585,7 +1755,7 @@ mod tests {
             s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
         }
         s.m.terminate(b, super::bitcode::Term::Ret);
-        s.finish()
+        s.finish().0
     }
 
     #[test]
@@ -1608,6 +1778,7 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            spec_constants: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1620,6 +1791,7 @@ mod tests {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
+                spec_constants: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -2229,6 +2401,7 @@ mod tests {
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
             root_indexed_views: Vec::new(),
+            spec_constants: Vec::new(),
         };
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
         // Twelve dwords: the loads below run across the view's end.
@@ -2382,6 +2555,7 @@ mod tests {
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
+                spec_constants: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
@@ -2788,9 +2962,10 @@ mod barycentric_tests {
             }
         }
         s.m.terminate(s.entry, Term::Ret);
+        let (dxil, spec_constants) = s.finish();
         let vs = HostShader {
             stage: HwStage::Vs,
-            dxil: s.finish(),
+            dxil,
             user_data: Vec::new(),
             samplers: Vec::new(),
             static_samplers: Vec::new(),
@@ -2798,6 +2973,7 @@ mod barycentric_tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            spec_constants,
         };
         validate(&vs);
         // One triangle covers an 8x8 target, with attribute values 2, 6, 10.
