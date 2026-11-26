@@ -127,6 +127,20 @@ enum Command {
         #[arg(long, hide = true)]
         these: Option<String>,
     },
+    /// (The child of `translate --pipelines` with `VICTORY_PIPELINE_ISOLATE=1`.)
+    /// Re-translates one container and compiles its host pipeline; a driver
+    /// crash ends this process, which the parent reads as a crash.
+    #[cfg(windows)]
+    PipelineCheck {
+        file: PathBuf,
+    },
+    /// (The child of a run's `VICTORY_PIPELINE_ISOLATE=1` path.) Makes the
+    /// host pipeline of one serialised pipeline; a driver crash ends this
+    /// process, which the run reads as a crash.
+    #[cfg(windows)]
+    MakePending {
+        file: PathBuf,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -224,6 +238,19 @@ fn main() -> Result<()> {
         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        #[cfg(windows)]
+        Command::PipelineCheck { file } => translate::pipeline_check(&file),
+        #[cfg(windows)]
+        Command::MakePending { file } => {
+            let cfg = victory_core::Config::load()?;
+            // The pipeline library and the shader cache the run made the
+            // pipeline in; the child makes its own and stores to the same
+            // folders (the pipeline object is discarded: it is the run's
+            // canary, see `victory_gpu::pipeline::make`).
+            victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+            let bytes = std::fs::read(&file)?;
+            std::process::exit(i32::from(!victory_hle::known_pipelines::make_pending(&bytes)));
+        }
         Command::Run {
             exe,
             unimplemented,

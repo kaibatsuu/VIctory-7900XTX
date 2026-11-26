@@ -528,7 +528,7 @@ fn translate(
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
     let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
-    translate_programs(&container, programs, &example, t, checks);
+    translate_programs(&container, &bytes, programs, &example, t, checks);
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);
@@ -541,7 +541,7 @@ fn translate(
     }
 }
 
-fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
+fn translate_programs(container: &Container, bytes: &[u8], programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
     for p in programs {
         t.programs += 1;
         match victory_shader::spill::build(&p) {
@@ -609,7 +609,7 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                         Ok(shader) => {
                             census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;
-                            check(shader, t, checks, label);
+                            check(shader, bytes, t, checks, label);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
                             .fail(format!("emit: {what}"), || {
@@ -678,6 +678,7 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
 /// Validates an emitted shader if asked to.
 fn check(
     mut shader: emit::HostShader,
+    bytes: &[u8],
     t: &mut Tally,
     checks: &mut Checks,
     label: impl Fn() -> String,
@@ -705,11 +706,17 @@ fn check(
         );
     }
     if let Some((h, stub_ps)) = &checks.host {
-        let made = match shader.stage {
-            HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
-            HwStage::Cs => h.compute_pipeline(&shader).map(drop),
-            HwStage::Ms => h.mesh_pipeline(&shader, stub_ps).map(drop),
-            _ => host::stub_vs(&shader).and_then(|vs| h.pipeline(&vs, &shader).map(drop)),
+        let made = if isolate_pipelines() {
+            // The child re-translates the container and compiles its host
+            // pipeline; a driver crash ends the child, not this process.
+            compile_in_child(bytes).into_result()
+        } else {
+            match shader.stage {
+                HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
+                HwStage::Cs => h.compute_pipeline(&shader).map(drop),
+                HwStage::Ms => h.mesh_pipeline(&shader, stub_ps).map(drop),
+                _ => host::stub_vs(&shader).and_then(|vs| h.pipeline(&vs, &shader).map(drop)),
+            }
         };
         match made {
             Ok(()) => {
@@ -761,6 +768,132 @@ fn check(
             t.fail(format!("validator: {first}"), label);
         }
     }
+}
+
+/// `VICTORY_PIPELINE_ISOLATE=1`: `translate --pipelines` compiles each host
+/// pipeline in a child process, so a driver crash ends that process, not
+/// this one (it then reads as a refused pipeline).
+fn isolate_pipelines() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_ISOLATE").is_some_and(|v| v == "1"))
+}
+
+/// What came of a host pipeline compiled in a child process.
+#[cfg(windows)]
+enum CompileOutcome {
+    Made,
+    Refused(String),
+    Crashed,
+}
+
+#[cfg(windows)]
+impl CompileOutcome {
+    fn into_result(self) -> Result<(), String> {
+        match self {
+            CompileOutcome::Made => Ok(()),
+            CompileOutcome::Refused(why) => Err(why),
+            CompileOutcome::Crashed => Err(
+                "the driver crashed compiling the host pipeline (isolated in a child process)"
+                    .into(),
+            ),
+        }
+    }
+}
+
+/// Compiles `container`'s host pipeline in a child process (`pipeline-check`)
+/// and says what came of it. The container is written to a file in the
+/// system's temporary folder, read back and re-translated by the child; the
+/// child inherits the environment, so its translation matches this one's.
+#[cfg(windows)]
+fn compile_in_child(container: &[u8]) -> CompileOutcome {
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::AtomicU64;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    // The container is the title's own code: staged in the cache folder, not
+    // the system's temp folder (and the cache folder is where the run can
+    // write in a confined environment).
+    let dir = victory_core::Config::load()
+        .map(|c| c.cache_dir)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join(format!(
+        "victory-pipeline-{}-{}.cdxil",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    if let Err(e) = std::fs::write(&file, container) {
+        return CompileOutcome::Refused(format!(
+            "could not write the shader for the child process ({}): {e}",
+            file.display()
+        ));
+    }
+    let spawned = std::env::current_exe().ok().and_then(|exe| {
+        Command::new(exe)
+            .arg("pipeline-check")
+            .arg(&file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()
+    });
+    let outcome = match spawned {
+        Some(mut child) => match child.wait() {
+            Ok(status) if status.success() => CompileOutcome::Made,
+            Ok(status) if status.code() == Some(1) => CompileOutcome::Refused("host pipeline refused".into()),
+            Ok(_) => CompileOutcome::Crashed,
+            Err(e) => CompileOutcome::Refused(e.to_string()),
+        },
+        None => CompileOutcome::Refused("could not start the child process".into()),
+    };
+    let _ = std::fs::remove_file(&file);
+    outcome
+}
+
+/// The child of `translate --pipelines` with `VICTORY_PIPELINE_ISOLATE=1`:
+/// re-translates one container and compiles its host pipeline. Exits 0 when
+/// the pipeline is made, 1 when the translator or the host refuses it; a
+/// driver crash ends this process with the crash's code.
+#[cfg(windows)]
+pub fn pipeline_check(file: &Path) -> Result<()> {
+    let bytes = std::fs::read(file).map_err(anyhow::Error::msg)?;
+    // The host settings the parent translated with; the child inherits the
+    // environment, and these globals are what the translate command set.
+    if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
+        victory_shader::emit::set_view_heap_limit(n);
+    }
+    if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
+        victory_shader::emit::set_host_max_wave(n);
+    }
+    if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
+        victory_shader::emit::set_host_max_wave(n);
+    }
+    victory_shader::emit::set_host_rdna(std::env::var_os("VICTORY_HOST_RDNA").is_some_and(|v| v == "1"));
+    let shader = match victory_shader::emit::translate(&bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    let host = match Host::new(false) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    let made = match shader.stage {
+        HwStage::Vs => host.pipeline(&shader, &host::stub_ps()).map(drop),
+        HwStage::Cs => host.compute_pipeline(&shader).map(drop),
+        HwStage::Ms => host.mesh_pipeline(&shader, &host::stub_ps()).map(drop),
+        _ => host::stub_vs(&shader).and_then(|vs| host.pipeline(&vs, &shader).map(drop)),
+    };
+    if let Err(e) = made {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// Emission counts of `stage`'s kind: 0 programs, 1 emitted, 2 validated,

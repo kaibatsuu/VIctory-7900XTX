@@ -78,7 +78,11 @@ impl Pending {
     fn make(&self) {
         self.made.get_or_init(|| {
             let began = Instant::now();
-            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            let made = if isolate() {
+                isolated_make(&self.shaders, self.graphics.as_deref())
+            } else {
+                HostPipeline::new(&self.shaders, self.graphics.as_deref())
+            };
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
         });
@@ -86,6 +90,68 @@ impl Pending {
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
+}
+
+/// `VICTORY_PIPELINE_ISOLATE=1`: a driver crash while a host pipeline is
+/// compiled ends a child process, not the run. The child is a canary: it
+/// makes the same pipeline, and the run makes its own only when the child
+/// reports that the compile does not crash (the driver's crash is
+/// deterministic, so a child that survived says this compile is safe).
+fn isolate() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_ISOLATE").is_some_and(|v| v == "1"))
+}
+
+/// Makes the host pipeline through a child process ([`isolate`]); `None` if
+/// the child refused or died. A child that died costs this one pipeline.
+fn isolated_make(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> Option<HostPipeline> {
+    if !canary(&super::known::pending(shaders, graphics)) {
+        tracing::warn!(
+            ?shaders,
+            "no host pipeline: the driver crashed compiling it (isolated in a child process)"
+        );
+        return None;
+    }
+    HostPipeline::new(shaders, graphics)
+}
+
+/// Has a child process make the serialised pipeline; whether it was made (a
+/// child that died, e.g. a driver crash, is "no"). The child runs at idle
+/// priority, like [`workers`] do.
+fn canary(bytes: &[u8]) -> bool {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    const IDLE_PRIORITY_CLASS: u32 = 0x40;
+    // Staged in the pipeline cache folder (always writable, and outside the
+    // repository), not the system's temp folder.
+    let dir = super::library::folder().unwrap_or_else(std::env::temp_dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join(format!(
+        "victory-make-pending-{}-{}.bin",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    if std::fs::write(&file, bytes).is_err() {
+        return false;
+    }
+    let made = std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            Command::new(exe)
+                .arg("make-pending")
+                .arg(&file)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(IDLE_PRIORITY_CLASS)
+                .spawn()
+                .ok()
+        })
+        .and_then(|mut child| child.wait().ok().map(|s| s.success()))
+        .unwrap_or(false);
+    let _ = std::fs::remove_file(&file);
+    made
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
