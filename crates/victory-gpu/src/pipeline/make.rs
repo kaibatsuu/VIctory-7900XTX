@@ -21,7 +21,7 @@
 //! its end (run textures-d2, the first after a new translation; Belobug
 //! 18e57db8 found the same).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -103,22 +103,93 @@ fn isolate() -> bool {
 }
 
 /// Makes the host pipeline through a child process ([`isolate`]); `None` if
-/// the child refused or died. A child that died costs this one pipeline.
+/// the child refused or died. A child that died costs this one pipeline,
+/// unless the translate path's bisect has cached a mnemonic whose disabling
+/// lets the driver compile it: then the pipeline is made with that fallback.
 fn isolated_make(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> Option<HostPipeline> {
-    if !canary(&super::known::pending(shaders, graphics)) {
-        tracing::warn!(
-            ?shaders,
-            "no host pipeline: the driver crashed compiling it (isolated in a child process)"
-        );
-        return None;
+    let bytes = super::known::pending(shaders, graphics);
+    if !canary(&bytes, None) {
+        let Some(mnemonic) = fallback_for(shaders) else {
+            tracing::warn!(
+                ?shaders,
+                "no host pipeline: the driver crashed compiling it (isolated in a child process)"
+            );
+            return None;
+        };
+        // The fallback is re-checked in a child first: a wrong or stale
+        // mnemonic must cost a child, not the run (the driver's crash is
+        // deterministic, so this child's survival means the fallback works).
+        if !canary(&bytes, Some(mnemonic)) {
+            tracing::warn!(
+                ?shaders,
+                "no host pipeline: the driver crashed compiling it even with the cached fallback"
+            );
+            return None;
+        }
+        // SAFETY: set before this pipeline is translated; the child above
+        // already confirmed the disabled mnemonic makes the driver compile.
+        unsafe { std::env::set_var("VICTORY_DISABLE_MNEMONIC", mnemonic) };
+        tracing::info!(?shaders, %mnemonic, "host pipeline made with the cached fallback");
+        return HostPipeline::new(shaders, graphics);
     }
     HostPipeline::new(shaders, graphics)
 }
 
+/// The fallback cache written by the translate path's bisect, loaded once:
+/// one `<shader-hash> <driver-version> <mnemonic>` per line, keyed by
+/// `(hash, driver)` so a driver update re-checks the fallback.
+fn fallbacks() -> &'static HashMap<(String, i64), String> {
+    static FALLBACKS: OnceLock<HashMap<(String, i64), String>> = OnceLock::new();
+    FALLBACKS.get_or_init(|| {
+        let mut map = HashMap::new();
+        if let Ok(text) = std::fs::read_to_string(fallbacks_file()) {
+            for line in text.lines() {
+                let mut words = line.split(' ');
+                let (Some(hash), Some(driver), Some(mnemonic)) =
+                    (words.next(), words.next(), words.next())
+                else {
+                    continue;
+                };
+                let Ok(driver) = driver.parse::<i64>() else {
+                    continue;
+                };
+                map.insert((hash.to_owned(), driver), mnemonic.to_owned());
+            }
+        }
+        map
+    })
+}
+
+/// The cache folder's `pipeline-fallbacks.txt`, the same file the translate
+/// path's bisect writes (`VICTORY_CACHE_DIR`, else the platform default).
+fn fallbacks_file() -> std::path::PathBuf {
+    let dir = std::env::var_os("VICTORY_CACHE_DIR")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("LOCALAPPDATA")
+                .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
+                .map(std::path::PathBuf::from)
+                .map(|base| base.join("victory").join("cache"))
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    dir.join("pipeline-fallbacks.txt")
+}
+
+/// The mnemonic cached for any of `shaders`, for this driver.
+fn fallback_for(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    let driver = crate::host::host().map(|h| h.driver()).unwrap_or(0);
+    shaders.iter().find_map(|s| {
+        let key = (s.hash.clone(), driver);
+        fallbacks().get(&key).map(|m| m.as_str())
+    })
+}
+
 /// Has a child process make the serialised pipeline; whether it was made (a
-/// child that died, e.g. a driver crash, is "no"). The child runs at idle
-/// priority, like [`workers`] do.
-fn canary(bytes: &[u8]) -> bool {
+/// child that died, e.g. a driver crash, is "no"). With `disabled`, the named
+/// mnemonic is lowered as a no-op in the child, as the translate path's
+/// bisect does. The child runs at idle priority, like [`workers`] do.
+fn canary(bytes: &[u8], disabled: Option<&str>) -> bool {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -138,15 +209,17 @@ fn canary(bytes: &[u8]) -> bool {
     let made = std::env::current_exe()
         .ok()
         .and_then(|exe| {
-            Command::new(exe)
-                .arg("make-pending")
+            let mut cmd = Command::new(exe);
+            cmd.arg("make-pending")
                 .arg(&file)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .creation_flags(IDLE_PRIORITY_CLASS)
-                .spawn()
-                .ok()
+                .creation_flags(IDLE_PRIORITY_CLASS);
+            if let Some(mnemonic) = disabled {
+                cmd.env("VICTORY_DISABLE_MNEMONIC", mnemonic);
+            }
+            cmd.spawn().ok()
         })
         .and_then(|mut child| child.wait().ok().map(|s| s.success()))
         .unwrap_or(false);

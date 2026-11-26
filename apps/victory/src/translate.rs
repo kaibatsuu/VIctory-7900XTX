@@ -903,7 +903,11 @@ fn isolated_compile(container: &[u8], mnemonics: &[&'static str]) -> Result<(), 
         CompileOutcome::Made => Ok(()),
         CompileOutcome::Refused(why) => Err(why),
         CompileOutcome::Crashed => match find_crash_mnemonic(container, mnemonics) {
-            Some(culprit) => {
+            Some(producer) => {
+                // The producer's no-op makes the pipeline, but the driver
+                // miscompiles the instruction that consumes its result; narrow
+                // to that consumer when one of its no-ops alone makes it too.
+                let culprit = find_consumer_mnemonic(container, producer).unwrap_or(producer);
                 write_fallback(&shader, driver, culprit);
                 println!("pipeline fallback: disabled {culprit} (the driver crashes on it)");
                 Ok(())
@@ -929,6 +933,72 @@ fn find_crash_mnemonic(container: &[u8], mnemonics: &[&'static str]) -> Option<&
     mnemonics
         .iter()
         .copied()
+        .find(|&m| matches!(compile_in_child_with(container, &[m]), CompileOutcome::Made))
+}
+
+/// The IR programs of `container`, decoded and built, for the consumer
+/// bisect: which instructions read a producer's result.
+#[cfg(windows)]
+fn ir_programs(container: &[u8]) -> Vec<ir::Program> {
+    let Some(container) = Container::parse(container).ok() else {
+        return Vec::new();
+    };
+    let Some(dxil) = container
+        .part(FourCC::DXIL)
+        .or(container.part(FourCC::ACCC))
+        .map(|p| p.data)
+    else {
+        return Vec::new();
+    };
+    let Ok(programs) = native_programs(dxil) else {
+        return Vec::new();
+    };
+    programs
+        .into_iter()
+        .filter_map(|p| victory_shader::spill::build(&p).ok())
+        .collect()
+}
+
+/// The distinct mnemonics, in first-use order, of the instructions that read
+/// a value written by an instruction named `producer` — the consuming
+/// instructions the bisect narrows to (a buffer load, image sample, export,
+/// or a later VALU).
+#[cfg(windows)]
+fn consumer_mnemonics(programs: &[ir::Program], producer: &str) -> Vec<&'static str> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for program in programs {
+        let written: HashSet<ir::Value> = program
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| i.name() == producer)
+            .flat_map(|i| i.writes.iter().map(|&(_, v)| v))
+            .collect();
+        if written.is_empty() {
+            continue;
+        }
+        for inst in program.blocks.iter().flat_map(|b| &b.insts) {
+            if inst.reads.iter().any(|&(_, v)| written.contains(&v)) {
+                let name = inst.name();
+                if !name.is_empty() && name != producer && seen.insert(name) {
+                    out.push(name);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Narrows `producer` (a mnemonic whose no-op already makes the pipeline) to
+/// a consuming instruction's mnemonic whose own no-op also makes it, if one
+/// exists: the instruction the driver actually miscompiles. `None` when the
+/// producer has no readers, or none of their no-ops alone make the pipeline.
+#[cfg(windows)]
+fn find_consumer_mnemonic(container: &[u8], producer: &str) -> Option<&'static str> {
+    let programs = ir_programs(container);
+    consumer_mnemonics(&programs, producer)
+        .into_iter()
         .find(|&m| matches!(compile_in_child_with(container, &[m]), CompileOutcome::Made))
 }
 
@@ -1190,6 +1260,55 @@ mod tests {
                 Some(victory_core::PolicyError::InsideRepo { .. })
             ),
             "{err}"
+        );
+    }
+
+    /// The consumer bisect names only the instructions that read the
+    /// producer's result, in first-use order, and never the producer itself.
+    #[cfg(windows)]
+    #[test]
+    fn consumer_mnemonics_finds_readers_of_a_producer() {
+        use victory_shader::gfx10::{Encoding, Fields, Instruction, Valu};
+        use victory_shader::ir::{self, Exit, Inst, Program, Reg, Value};
+
+        let producer = Inst {
+            // v_mov_b32 (VOP1).
+            machine: Instruction::new(0, Encoding::Vop1, 0x001, vec![0]),
+            fields: Fields::Valu(Valu::default()),
+            reads: vec![],
+            writes: vec![(Reg::V(0), Value(7))],
+        };
+        let consumer = Inst {
+            // buffer_load_dword (MUBUF): reads the producer's v0.
+            machine: Instruction::new(4, Encoding::Mubuf, 0x00c, vec![0]),
+            fields: Fields::Valu(Valu::default()),
+            reads: vec![(Reg::V(0), Value(7)), (Reg::S(2), Value(1))],
+            writes: vec![(Reg::V(4), Value(9))],
+        };
+        // Another producer-named instruction reading the same value: excluded
+        // because the bisect already narrowed past the producer mnemonic.
+        let same_name = Inst {
+            machine: Instruction::new(8, Encoding::Vop1, 0x001, vec![0]),
+            fields: Fields::Valu(Valu::default()),
+            reads: vec![(Reg::V(0), Value(7))],
+            writes: vec![(Reg::V(5), Value(10))],
+        };
+        let program = Program {
+            wave64: true,
+            vgprs: 8,
+            blocks: vec![ir::Block {
+                offset: 0,
+                preds: vec![],
+                phis: vec![],
+                insts: vec![producer, consumer, same_name],
+                exit: Exit::End,
+            }],
+            inputs: vec![],
+        };
+
+        assert_eq!(
+            super::consumer_mnemonics(&[program], "v_mov_b32"),
+            vec!["buffer_load_dword"]
         );
     }
 }

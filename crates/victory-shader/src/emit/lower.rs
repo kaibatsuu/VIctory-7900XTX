@@ -5275,6 +5275,19 @@ impl<'a> Lower<'a> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();
+        if Self::disabled_mnemonics().iter().any(|m| m == name) {
+            // No-op: write 0 to every register dword the instruction writes,
+            // so its result is well-defined for whoever reads it. VALU has no
+            // side effects, so that alone is complete there; for a consuming
+            // load or sample the missing read reads as 0, and a skipped export
+            // just drops its output — each keeps the shader compilable, which
+            // is what the bisect counts as "made".
+            let zero = self.s.m.i32(0);
+            for &(_, v) in &inst.writes {
+                self.vals.insert(v, Val::I32(zero));
+            }
+            return Ok(());
+        }
         self.local_ok = name.starts_with("s_bcnt1_i32_")
             || name.starts_with("s_ff1_i32_")
             || name.starts_with("v_mbcnt_");
@@ -7730,16 +7743,6 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
-        if Self::disabled_mnemonics().iter().any(|m| m == name) {
-            // No-op: write 0 to every register dword the instruction writes,
-            // so its result is well-defined for whoever reads it. (Side
-            // effects are VALU's none, so this is complete on its own.)
-            let zero = self.s.m.i32(0);
-            for &(_, v) in &inst.writes {
-                self.vals.insert(v, Val::I32(zero));
-            }
-            return Ok(());
-        }
         if self.x.res.waterfall.compares.contains(&(b, i)) {
             // The first lane's dwords of a waterfall loop are each lane's
             // own (see `resource::Waterfall`).
