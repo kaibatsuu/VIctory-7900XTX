@@ -757,11 +757,12 @@ pub(crate) static MADE: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::
 pub(crate) static ALIVE: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 
 /// About host lists, for the memory line: lists made by the host since the
-/// start; preludes made (a list's second allocator and list, made when it
-/// first needs one, [`lazy_prelude`]); and, in diagnostics builds, the
-/// bytes the process's private memory grew by while lists were being made
-/// (what a list costs: host objects with the driver's command memory; 631
-/// lists were alive in run 65, each with a prelude it may never use).
+/// start; preludes made (a list's second allocator and list, made by the
+/// shared pool [`PRELUDES`] when a submission needs one and there is none
+/// free); and, in diagnostics builds, the bytes the process's private
+/// memory grew by while lists were being made (what a list costs: host
+/// objects with the driver's command memory; 631 lists were alive in run
+/// 65, each then with a prelude it may never use).
 /// Then the lists alive that were never reset since they were made: the
 /// host sides of title lists the title made and has not used (a host list
 /// cost 0.68 MB of private memory in run 69: 431 MB for the 632 the title
@@ -1175,9 +1176,6 @@ pub(crate) struct HostList {
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
-    /// The list that runs those transitions just before this one, made
-    /// when the list first has such transitions ([`lazy_prelude`]).
-    prelude: OnceLock<Option<Prelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: std::sync::Arc<Mutex<std::collections::BTreeSet<String>>>,
     /// What its indirect executions ran, for the report of a removed device.
@@ -1219,16 +1217,28 @@ pub(crate) struct HostList {
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 
-/// Whether a host list's prelude is made when the list first needs one. A
-/// prelude runs the texture transitions and twin copies a list needs before
-/// it; lists that name no texture never have one, and every host list was
-/// made with one all the same: twice the host objects per list, for the
-/// title's 630 lists and for every list made anew.
-/// `VICTORY_LAZY_PRELUDE=0`: made with the list, as before.
-fn lazy_prelude() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_PRELUDE").is_none_or(|v| v != "0"))
+/// The shared pool a list's prelude is drawn from ([`Prelude`]). A prelude
+/// runs the texture transitions and twin copies a list needs before it, and
+/// has to live only while that submission is on the card, so it is held here
+/// (not by every list for its life) and drawn again once its submission has
+/// run. A prelude whose submission is still on the card is not drawn again.
+struct PreludePool {
+    /// Preludes free to draw: none of them is in flight.
+    free: Vec<Prelude>,
+    /// Preludes on the card, by the fence value signalled behind their
+    /// submission; free once that value completes.
+    inflight: Vec<(u64, Prelude)>,
 }
+
+// SAFETY: D3D12 command allocators and lists are free-threaded, and the pool
+// is only touched while the submission lock is held.
+unsafe impl Send for PreludePool {}
+
+/// The shared pool of preludes ([`PreludePool`]).
+static PRELUDES: Mutex<PreludePool> = Mutex::new(PreludePool {
+    free: Vec::new(),
+    inflight: Vec::new(),
+});
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
@@ -4053,6 +4063,45 @@ impl Host {
         list
     }
 
+    /// A prelude from the shared pool ([`PRELUDES`]) for one submission:
+    /// preludes whose submission has run come back first, then one of the
+    /// free ones, or a new one made when there is none.
+    fn take_prelude(&self) -> Option<Prelude> {
+        // SAFETY: a plain query of our fence.
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        let mut pool = PRELUDES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut i = 0;
+        while i < pool.inflight.len() {
+            if pool.inflight[i].0 <= completed {
+                let (_, prelude) = pool.inflight.swap_remove(i);
+                pool.free.push(prelude);
+            } else {
+                i += 1;
+            }
+        }
+        pool.free.pop().or_else(|| self.make_prelude())
+    }
+
+    /// The prelude's submission is on the card, with the fence signalled
+    /// behind it at `fence`: it is free to draw again once that value
+    /// completes.
+    fn give_prelude(&self, prelude: Prelude, fence: u64) {
+        PRELUDES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .inflight
+            .push((fence, prelude));
+    }
+
+    /// A prelude that never ran goes back for the next submission.
+    fn free_prelude(&self, prelude: Prelude) {
+        PRELUDES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .free
+            .push(prelude);
+    }
+
     /// An allocator and a closed list for a prelude.
     fn make_prelude(&self) -> Option<Prelude> {
         // SAFETY: plain object creation.
@@ -4089,10 +4138,6 @@ impl Host {
                 &allocator,
                 None,
             )?;
-            let prelude = OnceLock::new();
-            if !lazy_prelude() {
-                let _ = prelude.set(self.make_prelude());
-            }
             #[cfg(feature = "diagnostics")]
             let notes = std::sync::Arc::<Mutex<Vec<Note>>>::default();
             let pipelines = std::sync::Arc::<Mutex<std::collections::BTreeSet<String>>>::default();
@@ -4123,7 +4168,6 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
-                prelude,
                 pipelines,
                 #[cfg(feature = "diagnostics")]
                 indirects,
@@ -5761,11 +5805,13 @@ impl Host {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
         stage.next("submit: the lists' steps");
+        let mut preludes = Vec::new();
         for list in runs {
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            if let Some((prelude, drawn)) = list.prelude() {
                 lists.push(Some(prelude));
+                preludes.push(drawn);
             }
             lists.push(list.list.cast().ok());
         }
@@ -5854,6 +5900,11 @@ impl Host {
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
+            // The preludes ran with the submission: free once its fence
+            // value completes.
+            for prelude in preludes.drain(..) {
+                self.give_prelude(prelude, *submitted);
+            }
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
             crate::timeline::sent(sending, *submitted, stamp);
@@ -5951,6 +6002,10 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        // The preludes ran and were waited for: they are free again.
+        for prelude in preludes.drain(..) {
+            self.give_prelude(prelude, *submitted);
+        }
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
         let gpu = prepared.elapsed();
@@ -6695,7 +6750,7 @@ impl HostList {
     /// states become those the list ends with. For depth textures with a
     /// colour twin it first copies the side the list uses as it finds it
     /// from the other, if a list submitted earlier left it behind.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    fn prelude(&self) -> Option<(ID3D12CommandList, Prelude)> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -6759,15 +6814,12 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() {
             return None;
         }
-        let Some((allocator, list)) = self
-            .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
-            .as_ref()
-        else {
+        let Some(prelude) = host().and_then(|h| h.take_prelude()) else {
             fail(format_args!("no host list for a state prelude"));
         };
-        // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
+        let (allocator, list) = &prelude;
+        // SAFETY: the prelude is not in flight (drawn from the pool's free
+        // ones, whose submissions have run); the textures are live.
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
@@ -6786,7 +6838,16 @@ impl HostList {
         if let Err(e) = recorded {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
-        list.cast().ok()
+        match list.cast() {
+            Ok(list) => Some((list, prelude)),
+            Err(_) => {
+                // It never ran: give it back for the next submission.
+                if let Some(host) = host() {
+                    host.free_prelude(prelude);
+                }
+                None
+            }
+        }
     }
 
     /// Notes what the command about to be recorded does, as a marker
