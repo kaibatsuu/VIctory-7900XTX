@@ -38,6 +38,20 @@ fn fast_of(sets: &[(u32, u8, u8)]) -> Vec<u32> {
     if fast.len() == sets.len() { Vec::new() } else { fast }
 }
 
+/// The cores `sets` lie on, each counted once whatever its threads.
+fn cores_of(sets: &[(u32, u8, u8)]) -> usize {
+    let mut cores: Vec<u8> = sets.iter().map(|c| c.2).collect();
+    cores.sort_unstable();
+    cores.dedup();
+    cores.len()
+}
+
+/// The PC's physical cores (of processor group 0, as everything here);
+/// `None` if the system says nothing.
+pub fn physical_cores() -> Option<usize> {
+    Some(cores_of(&cpu_sets())).filter(|&n| n > 0)
+}
+
 /// The sets of one fast core of the last, and all the others, for
 /// [`lane_core`]; `None` with fewer than six fast cores.
 fn one_core(sets: &[(u32, u8, u8)]) -> Option<(Vec<u32>, Vec<u32>)> {
@@ -169,7 +183,11 @@ mod tests {
         let (own, others) = one_core(&eight).unwrap();
         assert_eq!((own, others.len()), (vec![14, 15], 22));
         assert!(fast_of(&[]).is_empty());
+        assert_eq!(cores_of(&eight), 16);
+        assert_eq!(cores_of(&[]), 0);
         assert!(!cpu_sets().is_empty());
+        let logical = std::thread::available_parallelism().map_or(1, |n| n.get());
+        assert!(physical_cores().is_some_and(|n| n <= logical));
         std::thread::spawn(|| keep_on_fast_cores("test")).join().unwrap();
     }
 }

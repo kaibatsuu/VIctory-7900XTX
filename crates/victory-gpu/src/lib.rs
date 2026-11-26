@@ -91,6 +91,8 @@ mod watch;
 mod texback;
 
 #[cfg(windows)]
+pub use cores::physical_cores;
+#[cfg(windows)]
 pub use host::on_failure;
 
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and

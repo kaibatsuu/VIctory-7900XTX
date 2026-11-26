@@ -314,7 +314,7 @@ struct Files {
 
 impl Files {
     fn new(first: std::fs::File, io: Io) -> Files {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = worker_count();
         let others = match io {
             Io::One => 0,
             Io::Overlapped => 1,
@@ -591,6 +591,34 @@ struct Job {
 // SAFETY: as for `Lane`.
 unsafe impl Send for Job {}
 
+/// How many workers read, inflate and unpack the requests
+/// (`VICTORY_DSTORAGE_WORKERS=<n>`, 1 to 64, sets it outright): the PC's
+/// physical cores, not its logical processors as before (8, not 16, on an
+/// 8-core PC with two threads a core). A core's second thread adds little
+/// to this work and takes room from the submitting thread and the copies.
+/// Measured on such a PC by soldsawn (0bba762, carried in
+/// Op-lite/victory-scarlett f748fb5): copying back took 2.4-3.5 ms per MB
+/// with 8 workers against 5.7 with 16. Not measured here yet.
+fn worker_count() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        let logical = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let setting = std::env::var("VICTORY_DSTORAGE_WORKERS").ok();
+        let count = workers(setting.as_deref(), victory_gpu::physical_cores(), logical);
+        tracing::info!(count, logical, "dstorage: workers to start (VICTORY_DSTORAGE_WORKERS)");
+        count
+    })
+}
+
+/// [`worker_count`] for a setting, the physical cores the system names and
+/// the logical processors: half of those if it names none.
+fn workers(setting: Option<&str>, physical: Option<usize>, logical: usize) -> usize {
+    if let Some(n) = setting.and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| (1..=64).contains(n)) {
+        return n;
+    }
+    physical.unwrap_or(logical / 2).clamp(1, 32)
+}
+
 /// The scheduler, with its workers started on first use; `None` if not
 /// even one worker could start.
 fn scheduler() -> Option<&'static Scheduler> {
@@ -620,8 +648,7 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let started = (0..workers)
+        let started = (0..worker_count())
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
@@ -1764,6 +1791,23 @@ mod tests {
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
         // SAFETY: every object here starts with the runtime header.
         method(unsafe { &*object.cast::<Object>() }, slot)
+    }
+
+    #[test]
+    fn a_worker_a_physical_core_unless_set() {
+        // An 8-core PC with two threads a core.
+        assert_eq!(workers(None, Some(8), 16), 8);
+        // Set outright, within 1 to 64; else as unset.
+        assert_eq!(workers(Some(" 12 "), Some(8), 16), 12);
+        assert_eq!(workers(Some("64"), Some(8), 16), 64);
+        for wrong in ["0", "65", "many", ""] {
+            assert_eq!(workers(Some(wrong), Some(8), 16), 8, "{wrong:?}");
+        }
+        // No core count from the system: half the logical processors.
+        assert_eq!(workers(None, None, 16), 8);
+        assert_eq!(workers(None, None, 1), 1);
+        // Never more than 32 by default.
+        assert_eq!(workers(None, Some(96), 192), 32);
     }
 
     fn factory() -> *mut c_void {
