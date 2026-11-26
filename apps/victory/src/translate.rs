@@ -842,17 +842,69 @@ fn compile_in_child_with(container: &[u8], disabled: &[&str]) -> CompileOutcome 
     outcome
 }
 
-/// Compiles `container`'s host pipeline in a child, bisecting a driver crash
-/// down to the one mnemonic whose disabling avoids it, then compiling with
-/// that mnemonic disabled. `Ok` means a host pipeline was made (possibly with
-/// a mnemonic disabled); the culprit is printed.
+/// The host driver's build number (0 if not known), for the fallback cache
+/// key: a driver update changes it, so a cached fallback is re-checked.
+#[cfg(windows)]
+fn driver_version() -> i64 {
+    static VERSION: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *VERSION.get_or_init(|| Host::new(false).map(|h| h.driver_version()).unwrap_or(0))
+}
+
+/// The fallback cache: one line per shader and driver, `<hash> <driver> <mnemonic>`.
+#[cfg(windows)]
+fn fallbacks_file() -> std::path::PathBuf {
+    victory_core::Config::load()
+        .map(|c| c.cache_dir.join("pipeline-fallbacks.txt"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("victory-pipeline-fallbacks.txt"))
+}
+
+/// The mnemonic cached for `shader` and `driver`, if there is one.
+#[cfg(windows)]
+fn read_fallback(shader: &str, driver: i64) -> Option<String> {
+    let text = std::fs::read_to_string(fallbacks_file()).ok()?;
+    for line in text.lines() {
+        let mut words = line.split(' ');
+        let (s, d, m) = (words.next()?, words.next()?, words.next()?);
+        if s == shader && d.parse::<i64>().ok() == Some(driver) {
+            return Some(m.to_owned());
+        }
+    }
+    None
+}
+
+/// Appends a fallback to the cache (a torn last line is ignored on read).
+#[cfg(windows)]
+fn write_fallback(shader: &str, driver: i64, mnemonic: &str) {
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(fallbacks_file())
+    {
+        let _ = writeln!(file, "{shader} {driver} {mnemonic}");
+    }
+}
+
+/// Compiles `container`'s host pipeline in a child, applying the fallback
+/// cached for this shader and driver, else bisecting a driver crash down to
+/// the one mnemonic whose disabling makes the pipeline (then caching it).
+/// `Ok` means a host pipeline was made, possibly with a mnemonic disabled.
 #[cfg(windows)]
 fn isolated_compile(container: &[u8], mnemonics: &[&'static str]) -> Result<(), String> {
+    let shader = blake3::hash(container).to_hex()[..16].to_owned();
+    let driver = driver_version();
+    if let Some(cached) = read_fallback(&shader, driver)
+        && matches!(compile_in_child_with(container, &[&cached]), CompileOutcome::Made)
+    {
+        println!("pipeline fallback (cached): disabled {cached}");
+        return Ok(());
+    }
     match compile_in_child_with(container, &[]) {
         CompileOutcome::Made => Ok(()),
         CompileOutcome::Refused(why) => Err(why),
         CompileOutcome::Crashed => match find_crash_mnemonic(container, mnemonics) {
             Some(culprit) => {
+                write_fallback(&shader, driver, culprit);
                 println!("pipeline fallback: disabled {culprit} (the driver crashes on it)");
                 Ok(())
             }

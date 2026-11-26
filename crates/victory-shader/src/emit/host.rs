@@ -143,6 +143,21 @@ impl Host {
         }
     }
 
+    /// The driver's build number, as the system counts it (0: not known).
+    /// Keys the pipeline-fallback cache, so a driver update re-checks it.
+    pub fn driver_version(&self) -> i64 {
+        // SAFETY: plain DXGI queries.
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+                return 0;
+            };
+            let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter>(self.device.GetAdapterLuid()) else {
+                return 0;
+            };
+            adapter.CheckInterfaceSupport(&IDXGIDevice::IID).unwrap_or(0)
+        }
+    }
+
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
     /// indexed.

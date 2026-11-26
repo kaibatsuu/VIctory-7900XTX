@@ -7706,6 +7706,25 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// The mnemonics named in `VICTORY_FALLBACK_MNEMONIC` (comma-separated):
+    /// each is lowered with its semantically-correct-but-simpler emission
+    /// where one exists (e.g. `v_fma_f32` fused as a separate multiply and
+    /// add), so a driver bug in the normal emission is avoided without losing
+    /// the instruction's meaning. Mnemonics without such a fallback are
+    /// unchanged.
+    fn fallback_mnemonics() -> &'static [String] {
+        static FALLBACK: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        FALLBACK.get_or_init(|| {
+            std::env::var("VICTORY_FALLBACK_MNEMONIC")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+    }
+
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
@@ -8171,9 +8190,16 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_fma_f32" | "v_fmaak_f32" | "v_fmamk_f32" => {
-                // shortcut: DXIL has no fused f32 multiply-add; FMad lets the driver fuse.
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
-                let r = self.fmad(a, bb, cc);
+                let r = if Self::fallback_mnemonics().iter().any(|m| m == name) {
+                    // Safe fallback: a separate multiply and add, not the
+                    // fused form the host driver's compiler crashes on.
+                    let mul = self.s.m.bin(c, Bin::Mul, a, bb);
+                    self.s.m.bin(c, Bin::Add, mul, cc)
+                } else {
+                    // shortcut: DXIL has no fused f32 multiply-add; FMad lets the driver fuse.
+                    self.fmad(a, bb, cc)
+                };
                 float(self, r)
             }
             "v_div_scale_f32" => {
