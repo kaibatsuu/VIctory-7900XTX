@@ -124,7 +124,7 @@ card-3); a bigger send makes its buffer anew.
   switch, `tiles::wanted()` is off by default and `resource::held_only()` is
   on (`VICTORY_HELD_LEVELS=0` turns it off). Nothing to port; do not set that
   switch in a launcher.
-- **PR #927 half views** (`VICTORY_HALF_VIEWS`: 16-bit channels moved through
+- **PR #927 half views** (`HALF_VIEWS` in their tree: 16-bit channels moved through
   unsigned-integer views, fixes frozen faces and a blurred disc in
   cutscenes). Absent here entirely: no `halves.rs`, no `HostShader::half_views`,
   no host twin view or fresh table per draw. Their own note scopes the
@@ -133,40 +133,40 @@ card-3); a bigger send makes its buffer anew.
   session (~2 files in the translator, ~3 in the GPU crate, a cache-key bump,
   a new per-draw table path), and only worth it if faces or cloth misbehave
   on this card.
-- **`VICTORY_D16_BITS`** (keep the low 16 bits of a d16 read through an
+- **d16 bits** (`D16_BITS` in their tree; keep the low 16 bits of a d16 read through an
   integer view; ~45 lines, 1,450 mesh programs change). The strongest shader
   accuracy candidate after early depth, but it has no test in their tree and
   touches typed-image semantics; take it with a picture A/B, not blind.
-- **`VICTORY_TABLE_MEMO`** (their biggest descriptor win: 81 % of ~54,000
+- **Table memo** (`TABLE_MEMO` in their tree; their biggest descriptor win: 81 % of ~54,000
   table entries a frame are already ready earlier in the list). Needs an
   entry memo keyed on the list's epoch plus `readable` hooks in `draw.rs`, and
   the aliased-view guard from their `memo_copy` or it reintroduces a stale
   read; ~350-450 lines. Its own session.
-- **`VICTORY_LIST_ALIAS_EXACT`** (a table entry known ready is made readable
+- **List alias exact** (`LIST_ALIAS_EXACT` in their tree; a table entry known ready is made readable
   again when its view is an aliased texture). Their fix assumes
   `texture::alias` copies again after a write that does not change the
   texture's state; **our `texture::alias` skips exactly that case**
   (`first_use` and `transition` both unchanged), so the switch would add a
   lookup and change nothing. The real fix is fxceless `19a45d1`'s
   `alias_source_changed`, a separate port.
-- **`VICTORY_PAGE_POOL`** (textures on 64 KiB pages: ~1.2 GB less texture
+- **Page pool** (`PAGE_POOL` in their tree; textures on 64 KiB pages: ~1.2 GB less texture
   memory, no frame cost). ~1,800 lines with a page mover their own notes say
   loses the device on the test card. Not for one sitting.
-- **`VICTORY_POOL_CLASSES` / `_CAP` / `_DRAIN`** (2.0-2.9 GB of holes in
+- **Pool classes** (`POOL_CLASSES` / `_CAP` / `_DRAIN` in their tree; 2.0-2.9 GB of holes in
   texture blocks): ~500-600 lines of pool surgery.
-- **`VICTORY_DROP_DXIL`** (let a translated shader's host code go after its
+- **Dropping a shader's DXIL** (`DROP_DXIL` in their tree; let a translated shader's host code go after its
   pipelines are made): at most ~0.1 GB of 30, plus a disk read per later
   pipeline.
-- **Store-side NaN guard** (`VICTORY_NAN_GUARD_STORES`): their image-store
+- **Store-side NaN guard** (`NAN_GUARD_STORES` in their tree): their image-store
   guard has no format check and our own measurement turned a packed colour
   `0xFF800000` into -65504. Skip; colour-export NaN is the safe half and
   would come with the d16/NaN pass if ever taken.
-- **FSR DLL swap** (`VICTORY_FSR_DLL`): loads a PC FidelityFX DLL the user
+- **FSR DLL swap** (`FSR_DLL` in their tree): loads a PC FidelityFX DLL the user
   supplies, replaces the title's upscaler, and bilinearly scales any frame
   the DLL refuses. Not a port (and needs a downloaded binary).
 - **Keyboard and mouse, auto-input, window icon**: input and tooling, not
   speed; this fork has its own mouse controls and scripted input.
-- **`VICTORY_BAKE_DELTA`** (a bake's source already in its host copy is not
+- **Bake delta** (`BAKE_DELTA` in their tree; a bake's source already in its host copy is not
   uploaded again): our bake pass has no pending-slot promote path to hook;
   the texture-side half alone would be a half fix.
 - **Early texture budget defaults 12 -> 40 ms and 1,500 -> 10,000 ms**:
@@ -175,7 +175,7 @@ card-3); a bigger send makes its buffer anew.
   `VICTORY_EARLY_TEXTURES_MS=40` as an environment test, no code.
 - **`VICTORY_FRAME_INTERVAL_MS` / `VICTORY_TITLE_FPS`** (their frame-cap
   lift): already here (`scripts/play.ps1 -Uncap`).
-- **`VICTORY_HOLDERS`, `VICTORY_CLEAN_STAMP`, `VICTORY_ASK_KEPT_EARLY`**:
+- **Holders, clean stamp and ask kept early** (`HOLDERS`, `CLEAN_STAMP`, `ASK_KEPT_EARLY` in their tree):
   diagnostics or "built, exact, no gain shown" in their own notes.
 
 ## What a run should look at
