@@ -23,6 +23,15 @@
 //! mean of the last seconds, so that turning into a dark corner is not black
 //! at once). No occlusion but the creases'.
 //!
+//! The frame it reads is lit by the stand-in itself. By day the sun's light
+//! is most of it; at night and indoors most of it is the stand-in's own, so
+//! what it raises it reads back the frame after: raised by more than it read
+//! (the light from one side counted up to 2.5 times the mean around), it
+//! climbed to its bounds and fell back, and rooms pulsed between too bright
+//! and too dark while standing still. The light from one side now raises a
+//! point by at most [`boost`] times the mean around, and each cell's light
+//! is followed over the last frames ([`cells_ms`]) before it is gathered.
+//!
 //! `VICTORY_AMBIENT`:
 //! - unset or `0`/`off`: the title's own output.
 //! - a number: that share of the estimate (1: all of it).
@@ -149,12 +158,56 @@ fn settle() -> Option<Settle> {
 }
 
 /// The share of the way the slow mean goes at this frame's keeping
-/// ([`Role::Radiance`]; the other passes do not read it).
-fn follow(role: Role) -> f32 {
+/// ([`Role::Radiance`]; the other passes do not read it), `dt` milliseconds
+/// after the last.
+fn follow(role: Role, dt: f32) -> f32 {
     match settle() {
-        Some(settle) if role == Role::Radiance => 1.0 - (-frame_ms(role) / settle.ms).exp(),
+        Some(settle) if role == Role::Radiance => 1.0 - (-dt / settle.ms).exp(),
         _ => 0.04,
     }
+}
+
+/// How each cell's light follows the frames before the estimate is gathered
+/// from it (`VICTORY_AMBIENT_CELLS=<time constant in ms>`; unset: 120; 0:
+/// the frame's alone, as before). A jump of the light around (a new room,
+/// [`settle`]) takes the frame's at once. Longer steadies a flickering lamp
+/// or the title's noise more, and the light lags more behind a turn.
+fn cells_ms() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        std::env::var("VICTORY_AMBIENT_CELLS")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(120.0)
+    })
+}
+
+/// The share of the way each cell's light goes at this frame's keeping
+/// ([`cells_ms`]; 1: the frame's).
+fn cell_follow(role: Role, dt: f32) -> f32 {
+    let ms = cells_ms();
+    if role != Role::Radiance || ms <= 0.0 {
+        return 1.0;
+    }
+    1.0 - (-dt / ms).exp()
+}
+
+/// The most the light from one side raises a point over the mean of the
+/// light around it (`VICTORY_AMBIENT_BOOST=<multiple>`, at least 1; unset:
+/// 1.25; 2.5 as before). Where the stand-in's own light is most of what it
+/// reads, this times the level times what a surface sends back of its light
+/// is what it reads back the frame after: kept under 1, it settles (at
+/// 0.8, 1.25 and a white wall's 0.85: 0.85); over 1 it climbs to its bounds.
+fn boost() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        std::env::var("VICTORY_AMBIENT_BOOST")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 1.0)
+            .unwrap_or(1.25)
+    })
 }
 
 /// Milliseconds since the last keeping ([`Role::Radiance`], once a frame);
@@ -199,21 +252,24 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=15, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
+#define RS "RootConstants(num32BitConstants=17, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
+#define SMOOTH (2 * CELLS + 1)
 #define PX 160
 #define PY 90
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; uint probe;
-    float jump; float fresh; float dt;
+    float jump; float fresh; float dt; float cell_follow;
+    float boost;
 };
 Texture2D<float> depth : register(t0);
-// Cells: the light they send out (then, at CELLS, the slow mean), from
-// CELLS + 1 on where they are.
+// Cells: the light they send out this frame (then, at CELLS, the slow mean),
+// from CELLS + 1 on where they are, from SMOOTH on their light followed over
+// the last frames (what the estimate is gathered from).
 RWStructuredBuffer<float4> cells : register(u1);
 // Three a point: red, green and blue, each a mean and a direction.
 RWStructuredBuffer<float4> points : register(u2);
@@ -263,6 +319,18 @@ void mean() {
     float age = was.a > 0.0 && !jumped ? was.a + dt : 0.001;
     cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, jumped ? 1.0 : follow) : now, age);
 }
+// Each cell's light followed over the last frames (`cell_follow`), after
+// `mean`: taken as it is when the light around just jumped (its age starts
+// again at 0.001 s) or nothing usable is kept yet.
+[RootSignature(RS)]
+[numthreads(8, 4, 1)]
+void smooth(uint3 at : SV_DispatchThreadID) {
+    uint i = at.y * CX + at.x;
+    float3 c = cells[i].rgb;
+    float4 kept = cells[SMOOTH + i];
+    bool anew = cells[CELLS].a < 0.0015 || kept.a != 1.0 || any(isnan(kept.rgb)) || any(isinf(kept.rgb));
+    cells[SMOOTH + i] = float4(anew ? c : lerp(kept.rgb, c, cell_follow), 1.0);
+}
 #endif
 
 #ifdef PLACE
@@ -286,7 +354,7 @@ void gather(uint3 at : SV_DispatchThreadID) {
     float3 toward = 0, light = 0, red = 0, green = 0, blue = 0;
     for (uint i = 0; i < CELLS; i++) {
         float4 c = cells[CELLS + 1 + i];
-        float3 L = cells[i].rgb;
+        float3 L = cells[SMOOTH + i].rgb;
         float3 d = c.xyz - p;
         float dd = dot(d, d);
         float w = c.w / (dd + r2);
@@ -400,7 +468,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
     }
     float3 all = float3(sr.w, sg.w, sb.w) / sum;
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
-    found = clamp(found, 0.2 * all, 2.5 * all);
+    // (At most `boost` times the light around: the stand-in reads its own
+    // light back, and raised by more than it read it climbs.)
+    found = clamp(found, 0.2 * all, boost * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     float3 was = unpack(light[p]);
     float left = dot(was, LUMA);
@@ -426,9 +496,10 @@ void raise(uint3 at : SV_DispatchThreadID) {
 #endif
 "#;
 
-/// Bytes of the cells' buffer and of the points'.
+/// Bytes of the cells' buffer (their light, the slow mean, where they are,
+/// their followed light) and of the points'.
 const CELLS: u64 = 64 * 36;
-const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
+const CELL_BYTES: u64 = (3 * CELLS + 1) * 16;
 const POINT_BYTES: u64 = 160 * 90 * 48;
 /// Where the slow mean is among the cells (float4s).
 pub(crate) const CELLS_AT: u32 = CELLS as u32;
@@ -437,6 +508,7 @@ struct Pass {
     root: ID3D12RootSignature,
     keep: ID3D12PipelineState,
     mean: ID3D12PipelineState,
+    smooth: ID3D12PipelineState,
     place: ID3D12PipelineState,
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
@@ -469,6 +541,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     };
     let keep = pipeline("KEEP", s!("keep"))?;
     let mean = pipeline("KEEP", s!("mean"))?;
+    let smooth = pipeline("KEEP", s!("smooth"))?;
     let place = pipeline("PLACE", s!("place"))?;
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
@@ -478,6 +551,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         root: root.ok_or_else(windows::core::Error::empty)?,
         keep,
         mean,
+        smooth,
         place,
         gather,
         raise,
@@ -553,7 +627,15 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
         if *said < 4 {
             *said += 1;
-            tracing::info!(?role, size = ?views.size, level, constant, "a stand-in for the indirect light");
+            tracing::info!(
+                ?role,
+                size = ?views.size,
+                level,
+                constant,
+                boost = boost(),
+                cells_ms = cells_ms(),
+                "a stand-in for the indirect light (VICTORY_AMBIENT_BOOST, VICTORY_AMBIENT_CELLS)"
+            );
         }
     }
     list.keep(&pass.cells);
@@ -561,19 +643,23 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.stats);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 15];
+    let mut words = [0u32; 17];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
+    // Asked once: the follows and the seconds go by the same frame time.
+    let dt = frame_ms(role);
     words[6] = views.size[0];
     words[7] = views.size[1];
-    words[8] = follow(role).to_bits();
+    words[8] = follow(role, dt).to_bits();
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
     words[11] = u32::from(crate::lightprobe::on());
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
-    words[14] = (frame_ms(role) / 1000.0).to_bits();
+    words[14] = (dt / 1000.0).to_bits();
+    words[15] = cell_follow(role, dt).to_bits();
+    words[16] = boost().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -581,7 +667,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, words.len() as u32, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -596,6 +682,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
             Role::Radiance => {
                 run(&pass.keep, 8, 9, 1);
                 run(&pass.mean, 1, 1, 1);
+                run(&pass.smooth, 8, 9, 1);
                 KEPT.store(true, Ordering::Relaxed);
             }
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
