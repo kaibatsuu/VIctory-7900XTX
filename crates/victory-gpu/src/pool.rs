@@ -162,6 +162,8 @@ pub(crate) struct Piece {
 struct Block<B> {
     memory: B,
     free: Ranges,
+    /// ([`heap_pack`]) Bytes of `free`: taken and given exactly.
+    room: u64,
     /// The end of the highest piece ever taken: above it the memory is as
     /// it was made (zeros).
     used_to: u64,
@@ -181,11 +183,29 @@ struct Pool<B> {
     spare: usize,
     most: usize,
     retry_growth_at: u64,
+    /// Empty blocks let go since the start ([`texture_blocks`]).
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    given_back: u64,
+    /// ([`heap_pack`]) Pieces go into the fullest block they fit.
+    pack: bool,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0, given_back: 0, pack: false }
+    }
+
+    /// ([`heap_pack`]) Of the blocks `ripe` takes, the fullest one `len`
+    /// fits in (lowest place in it), and that place.
+    fn take_fullest(&mut self, len: u64, align: u64, ripe: Ripe) -> Option<(usize, u64)> {
+        let mut order: Vec<(u64, usize)> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| b.as_ref().filter(|b| b.room >= len && ripe.is(b)).map(|b| (b.room, i)))
+            .collect();
+        order.sort_unstable();
+        order.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)))
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -211,13 +231,17 @@ impl<B: Clone> Pool<B> {
         }
         self.rested(now);
         let mut found = None;
-        for (i, block) in self.blocks.iter_mut().enumerate() {
-            if let Some(block) = block
-                && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
-            {
-                found = Some((i, start));
-                break;
+        if self.pack {
+            found = self.take_fullest(len, align, ripe);
+        } else {
+            for (i, block) in self.blocks.iter_mut().enumerate() {
+                if let Some(block) = block
+                    && ripe.is(block)
+                    && let Some(start) = block.free.take(len, align)
+                {
+                    found = Some((i, start));
+                    break;
+                }
             }
         }
         if found.is_none() && ripe.ahead > 0 {
@@ -250,6 +274,7 @@ impl<B: Clone> Pool<B> {
             }
         }
         let block = self.blocks[i].as_mut()?;
+        block.room = block.room.saturating_sub(len);
         let again = start < block.used_to;
         block.used_to = block.used_to.max(start + len);
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
@@ -274,7 +299,8 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] =
+            Some(Block { memory, free: Ranges::new(BLOCK), room: BLOCK, used_to: 0, made, since: crate::host::now_ms() });
         i
     }
 
@@ -292,6 +318,7 @@ impl<B: Clone> Pool<B> {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
+                block.room = block.room.saturating_add(piece.len).min(BLOCK);
                 any |= block.free.whole(BLOCK);
             }
         }
@@ -299,15 +326,17 @@ impl<B: Clone> Pool<B> {
         let most = SPARES.load(Ordering::Relaxed).min(self.most);
         if any || most < self.spare {
             self.spare = most;
-            let mut spare = 0;
+            let (mut spare, mut gone) = (0, 0);
             for block in &mut self.blocks {
                 if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
                     spare += 1;
                     if spare > most {
                         *block = None;
+                        gone += 1;
                     }
                 }
             }
+            self.given_back += gone;
         }
     }
 
@@ -385,6 +414,111 @@ struct Reclaim {
     methods: &'static [*const (); 3],
     references: AtomicU32,
     piece: Piece,
+    /// The texture's interface pointer ([`BLOCK_OF`]).
+    texture: usize,
+}
+
+/// (`VICTORY_HEAP_PACK`; from Op-lite/victory-scarlett, default off: the
+/// first block with room, lowest place in it, as before) Texture blocks are
+/// packed so that sparse ones empty and go back. The holes cost the card: the
+/// fork's run-103 held 16.3 GB of the card by the system's count (the free
+/// space inside blocks included) for 13.0 GB in use by the room rule's count
+/// (`crate::host::vram_keep`, which leaves that free space out), on a 14.9
+/// GB budget; past its budget the system moves card memory into the PC's.
+/// - `=1` or `=place`: a new piece goes into the fullest block it fits
+///   (lowest place in it), so holes in full blocks fill before sparse blocks
+///   get more;
+/// - `=1` also: the room rule (`crate::resource::let_go_idle` with a limit
+///   from `vram_keep`: past 88 % of the card, `VICTORY_TEXTURE_KEEP` unset)
+///   takes the copies it may take (its own idle times, unchanged)
+///   sparsest block first, least recently used within a 1/32 occupancy step
+///   ([`pack_rank`]; copies in no block before all of them): their blocks
+///   empty and go ([`SPARE`] kept from 85 % of the card on).
+///
+/// Nothing live is moved. In the fork's run-107 (with its raw-use guard,
+/// which it then rejected) packing ran (168 blocks, 137 of them over 75 %
+/// full, 1.7 GB free inside blocks, 15 given back, 4.1 GB of copies let go
+/// from sparse blocks) yet the card's raw use fell only 370 MB: sparse blocks
+/// hold copies in use. Read once.
+pub(crate) fn heap_pack() -> (bool, bool) {
+    static ON: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_HEAP_PACK").as_deref().map(str::trim) {
+        Ok("1") => (true, true),
+        Ok("place") => (true, false),
+        _ => (false, false),
+    })
+}
+
+/// ([`heap_pack`] `=1`) The block of each texture cut from one, by its
+/// interface pointer.
+static BLOCK_OF: Mutex<Option<std::collections::HashMap<usize, usize>>> = Mutex::new(None);
+
+/// ([`heap_pack`] `=1`) For the room rule: the block of each texture and the
+/// bytes in use of each block (`None`: no block there), taken together.
+pub(crate) struct Occupancy {
+    of: std::collections::HashMap<usize, usize>,
+    used: Vec<Option<u64>>,
+}
+
+impl Occupancy {
+    pub(crate) fn now() -> Occupancy {
+        let of = lock(&BLOCK_OF).clone().unwrap_or_default();
+        let used = lock(&TEXTURES).blocks.iter().map(|b| b.as_ref().map(|b| BLOCK - b.room)).collect();
+        Occupancy { of, used }
+    }
+
+    /// Bytes in use of the block `texture` (an interface pointer) lies in.
+    pub(crate) fn used_of(&self, texture: usize) -> Option<u64> {
+        self.of.get(&texture).and_then(|&i| self.used.get(i).copied().flatten())
+    }
+
+    /// The rank of `texture` for letting go: 0 for one in no block, else the
+    /// occupancy step (1..=32) of its block.
+    pub(crate) fn rank(&self, texture: usize) -> u64 {
+        pack_rank(self.used_of(texture), BLOCK)
+    }
+
+    /// Whether `texture` lies in a block under half in use ([`PACKED`]).
+    pub(crate) fn sparse(&self, texture: usize) -> bool {
+        self.used_of(texture).is_some_and(|used| used * 2 < BLOCK)
+    }
+}
+
+/// The steps of block occupancy candidates are ordered by ([`pack_rank`]).
+const PACK_STEPS: u64 = 32;
+
+/// A candidate's rank for letting go: the occupancy step of its block, `used`
+/// bytes of `size`; 0 for a copy in no block.
+pub(crate) fn pack_rank(used: Option<u64>, size: u64) -> u64 {
+    match used {
+        Some(used) if size > 0 => (used.min(size) * PACK_STEPS / size).min(PACK_STEPS - 1) + 1,
+        _ => 0,
+    }
+}
+
+/// Since the start: copies the room rule let go from blocks under half in use
+/// and their bytes ([`heap_pack`] `=1`).
+pub(crate) static PACKED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// For the memory line: texture blocks alive; of those holding something,
+/// by occupancy (<25 %, 25-50 %, 50-75 %, >75 %) and their free bytes; empty
+/// blocks; empty blocks let go since the start.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn texture_blocks() -> [u64; 8] {
+    let pool = lock(&TEXTURES);
+    let mut out = [0u64; 8];
+    for b in pool.blocks.iter().flatten() {
+        out[0] += 1;
+        if b.free.whole(BLOCK) {
+            out[6] += 1;
+            continue;
+        }
+        let used = BLOCK - b.room;
+        out[1 + ((used * 4 / BLOCK) as usize).min(3)] += 1;
+        out[5] += b.room;
+    }
+    out[7] = pool.given_back;
+    out
 }
 
 struct Methods([*const (); 3]);
@@ -422,6 +556,11 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
             HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
+            if heap_pack().1
+                && let Some(of) = lock(&BLOCK_OF).as_mut()
+            {
+                of.remove(&gone.texture);
+            }
             lock(&TEXTURES).give(gone.piece, now());
         }
         left
@@ -587,7 +726,11 @@ pub(crate) fn begun_before(texture: &ID3D12Resource) -> Option<u64> {
 /// Makes `texture` give `piece` back when the last reference to it goes.
 fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
     const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
-    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece }));
+    let raw = texture.as_raw() as usize;
+    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece, texture: raw }));
+    if heap_pack().1 {
+        lock(&BLOCK_OF).get_or_insert_with(Default::default).insert(raw, piece.block);
+    }
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.
     unsafe {
@@ -628,8 +771,9 @@ pub(crate) unsafe fn texture(
     if info.SizeInBytes == u64::MAX {
         return None;
     }
-    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+    let mut pool = lock(&TEXTURES);
+    pool.pack = heap_pack().0;
+    let taken = pool.take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: BLOCK,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -648,7 +792,11 @@ pub(crate) unsafe fn texture(
             return None;
         }
         heap
-    })?;
+    });
+    // (Before the lines below take the lock again.)
+    drop(pool);
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+    let (piece, heap, again) = taken?;
     let mut made: Option<ID3D12Resource> = None;
     // SAFETY: the piece is no one else's; the heap lives while a piece of
     // it is taken.
@@ -689,6 +837,93 @@ pub(crate) unsafe fn texture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_pieces_go_to_the_fullest_block_and_rooms_stay_exact() {
+        let mut pool: Pool<u32> = Pool::new(SPARE_KEPT);
+        let mut n = 0u32;
+        let mut make = || {
+            n += 1;
+            Some(n)
+        };
+        // Two blocks: the first nearly full, the second a quarter full.
+        // (Pieces of more than half a block are not pooled without ripe blocks.)
+        let (a, _, _) = pool.take(BLOCK / 2, 4096, 0, &mut make).unwrap();
+        let (a2, _, _) = pool.take(BLOCK / 2 - (4 << 20), 4096, 0, &mut make).unwrap();
+        assert_eq!(a.block, a2.block);
+        let (b, _, _) = pool.take(BLOCK / 2, 4096, 0, &mut make).unwrap();
+        assert_ne!(a.block, b.block);
+        pool.give(b, 0);
+        pool.rested(REST);
+        let (_, _, _) = pool.take(BLOCK / 4, 4096, REST, &mut make).unwrap();
+        pool.pack = true;
+        let (c, _, _) = pool.take(1 << 20, 4096, REST, &mut make).unwrap();
+        assert_eq!(c.block, a.block, "the fuller block takes the piece");
+        pool.pack = false;
+        let rooms: Vec<u64> = pool.blocks.iter().flatten().map(|b| b.room).collect();
+        assert_eq!(rooms, vec![3 << 20, BLOCK - BLOCK / 4]);
+        assert_eq!(pack_rank(None, BLOCK), 0);
+        assert_eq!(pack_rank(Some(0), BLOCK), 1);
+        assert_eq!(pack_rank(Some(BLOCK), BLOCK), PACK_STEPS);
+    }
+
+    /// (Not in the fork's tests, where the fuller block is also the first.)
+    /// The fuller block takes the piece when a sparser one comes first, which
+    /// is where the first one with room would have it.
+    #[test]
+    fn packed_pieces_pass_a_sparser_block_that_comes_first() {
+        let mut pool: Pool<u32> = Pool::new(SPARE_KEPT);
+        let mut n = 0u32;
+        let mut make = || {
+            n += 1;
+            Some(n)
+        };
+        // The first block full, the second nearly; the first emptied and a
+        // quarter of it taken again.
+        let (x, _, _) = pool.take(BLOCK / 2, 4096, 0, &mut make).unwrap();
+        let (y, _, _) = pool.take(BLOCK / 2, 4096, 0, &mut make).unwrap();
+        let (z, _, _) = pool.take(BLOCK / 2, 4096, 0, &mut make).unwrap();
+        let (w, _, _) = pool.take(BLOCK / 2 - (4 << 20), 4096, 0, &mut make).unwrap();
+        assert_eq!((x.block, y.block), (0, 0));
+        assert_eq!((z.block, w.block), (1, 1));
+        pool.give(x, 0);
+        pool.give(y, 0);
+        pool.rested(REST);
+        assert_eq!(pool.blocks(), 2, "one empty block is kept");
+        let (q, _, _) = pool.take(BLOCK / 4, 4096, REST, &mut make).unwrap();
+        assert_eq!(q.block, 0);
+        // Packed: the fuller second block; else the first with room.
+        pool.pack = true;
+        let (p, _, _) = pool.take(1 << 20, 4096, REST, &mut make).unwrap();
+        assert_eq!(p.block, 1, "the fuller block takes the piece");
+        pool.pack = false;
+        let (f, _, _) = pool.take(1 << 20, 4096, REST, &mut make).unwrap();
+        assert_eq!(f.block, 0, "unpacked, the first block with room takes it");
+        let rooms: Vec<u64> = pool.blocks.iter().flatten().map(|b| b.room).collect();
+        assert_eq!(rooms, vec![BLOCK - BLOCK / 4 - (1 << 20), 3 << 20]);
+        // A piece too big for the fullest block's room goes to the next one.
+        pool.pack = true;
+        let (g, _, _) = pool.take(8 << 20, 4096, REST, &mut make).unwrap();
+        assert_eq!(g.block, 0);
+    }
+
+    /// Copies in no block go first, then by their block's occupancy step.
+    #[test]
+    fn copies_rank_by_their_blocks_occupancy() {
+        let occupancy = Occupancy {
+            of: std::collections::HashMap::from([(100, 0), (200, 1), (300, 2)]),
+            used: vec![Some(BLOCK - (4 << 20)), Some(BLOCK / 8), None],
+        };
+        assert_eq!(occupancy.rank(7), 0, "in no block");
+        assert_eq!(occupancy.rank(300), 0, "its block let go");
+        assert!(occupancy.rank(200) < occupancy.rank(100));
+        assert_eq!(occupancy.rank(100), PACK_STEPS - 1);
+        assert_eq!(occupancy.rank(200), PACK_STEPS / 8 + 1);
+        assert!(occupancy.sparse(200) && !occupancy.sparse(100) && !occupancy.sparse(7));
+        assert_eq!(pack_rank(Some(BLOCK / 2), BLOCK), PACK_STEPS / 2 + 1);
+        assert_eq!(pack_rank(Some(BLOCK / 2 - 1), BLOCK), PACK_STEPS / 2);
+        assert_eq!(pack_rank(Some(1), 0), 0);
+    }
 
     #[test]
     fn ranges_are_cut_aligned_and_join_again() {
