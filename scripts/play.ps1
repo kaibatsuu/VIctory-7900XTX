@@ -2,6 +2,7 @@
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
+# -Uncap        no frame-rate limit at all (VICTORY_FRAME_INTERVAL_MS=0, VICTORY_TITLE_FPS=0); an experiment, not a playable setting
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
@@ -9,6 +10,7 @@ param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Safe,
     [switch]$RayTracing,
+    [switch]$Uncap,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{}
 )
@@ -24,6 +26,10 @@ if ($Safe) {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
+if ($Uncap) {
+    $settings.VICTORY_FRAME_INTERVAL_MS = '0'   # our frame clock never waits
+    $settings.VICTORY_TITLE_FPS = '0'           # the title's rate, limiter and shortest sim step: no limit
+}
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"

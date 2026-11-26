@@ -5,6 +5,8 @@
 
 mod census;
 mod inspect;
+#[cfg(windows)]
+mod launch_warm;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
 mod run;
@@ -139,6 +141,19 @@ enum Command {
         #[arg(long, hide = true)]
         these: Option<String>,
     },
+    /// (The child of `translate --pipelines` with `VICTORY_PIPELINE_ISOLATE=1`.)
+    /// Re-translates one container and compiles its host pipeline; a driver
+    /// crash ends this process, which the parent reads as a crash.
+    #[cfg(windows)]
+    PipelineCheck {
+        file: PathBuf,
+    },
+    /// (The child of a run's `VICTORY_PIPELINE_ISOLATE=1` fast path.) A
+    /// persistent process that makes many serialised pipelines, framed over
+    /// its pipes; a driver crash ends this process, which the run reads as a
+    /// crash.
+    #[cfg(windows)]
+    CanaryWorker,
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -181,6 +196,14 @@ enum Console {
 
 fn main() -> Result<()> {
     victory_core::logging::init("info");
+    // AMD's driver compiler (`amdxc64`) crashes on the translator's `REUSE`
+    // pass; set the workaround before anything opens the shader cache (its
+    // key reads `shader_opt` before the device is made). `VICTORY_AMD_COMPILER_FIX=0`
+    // keeps the pass.
+    victory_shader::emit::set_amd_compiler_fix(
+        victory_shader::emit::host::detect_amd()
+            && std::env::var("VICTORY_AMD_COMPILER_FIX").ok().is_none_or(|v| v != "0"),
+    );
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
@@ -229,6 +252,18 @@ fn main() -> Result<()> {
         Command::Shaders { paths, jobs, list } => translate::precompile(paths, jobs, list),
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        #[cfg(windows)]
+        Command::PipelineCheck { file } => translate::pipeline_check(&file),
+        #[cfg(windows)]
+        Command::CanaryWorker => {
+            let cfg = victory_core::Config::load()?;
+            // Translations only: the child never opens or maps the host
+            // pipeline library (the run keeps it), so it compiles each
+            // pipeline fresh and stores to a throwaway library.
+            victory_hle::known_pipelines::use_translations(cfg.cache_subdir("shaders")?);
+            victory_hle::canary_worker();
+            std::process::exit(0);
+        }
         Command::Run {
             exe,
             unimplemented,

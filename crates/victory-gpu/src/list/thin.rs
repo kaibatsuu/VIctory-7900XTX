@@ -58,6 +58,15 @@ pub(crate) fn wanted() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_THIN").is_some_and(|v| v == "1"))
 }
 
+/// Whether a recording's list of ours is given back once the card has run
+/// its submission (`VICTORY_LIST_RELEASE=1`), instead of when the title
+/// resets or releases the list. Off: the recording keeps its list until
+/// then, as before.
+pub(crate) fn release() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_RELEASE").is_some_and(|v| v == "1"))
+}
+
 /// What a title list keeps: the recording being written and the words of it
 /// not handed over yet.
 #[derive(Default)]
@@ -88,8 +97,9 @@ impl Front {
 
     /// Begins a recording, with `pipeline` bound.
     pub(super) fn begin(&mut self, kind: u32, pipeline: This) {
+        crate::pipeline::prefetch(pipeline);
         self.leave();
-        self.recording = Some(Arc::new(Recording::new(kind)));
+        self.recording = Some(Arc::new(Recording::new(kind, crate::frame::current())));
         self.closed = false;
         self.submitted = false;
         self.put(RESET, &[pipeline as u64]);
@@ -180,6 +190,8 @@ fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// yet, and the list of ours it goes to.
 pub(crate) struct Recording {
     kind: u32,
+    /// The frame the recording began in ([`Front::begin`]).
+    frame: u64,
     inner: Mutex<Inner>,
     /// Translated to its end.
     done: AtomicBool,
@@ -201,9 +213,10 @@ struct Inner {
 }
 
 impl Recording {
-    fn new(kind: u32) -> Self {
+    fn new(kind: u32, frame: u64) -> Self {
         Recording {
             kind,
+            frame,
             inner: Mutex::default(),
             done: AtomicBool::new(false),
             moved: Condvar::new(),
@@ -228,8 +241,28 @@ impl Recording {
         held(&self.inner).back as This
     }
 
+    /// The list of ours a submission runs, taken from the recording (with
+    /// [`release`] only): a fresh one is made if the last was taken already,
+    /// as when the title submits the closed list again. The list is then no
+    /// longer the recording's: it is given back once the card has run it
+    /// ([`crate::list::recycle`]).
+    pub(crate) fn take_back(&self) -> This {
+        let mut inner = held(&self.inner);
+        if inner.back == 0 {
+            inner.back = back_list(self.kind) as usize;
+        }
+        let back = inner.back as This;
+        inner.back = 0;
+        back
+    }
+
     /// Translates what there is.
     fn run(&self) {
+        // Waits during this recording are charged to the frame it began in.
+        crate::pipeline::with_recording_frame(self.frame, || self.run_chunks());
+    }
+
+    fn run_chunks(&self) {
         loop {
             let (chunk, back) = {
                 let mut inner = held(&self.inner);
@@ -297,6 +330,12 @@ fn back_list(kind: u32) -> This {
     let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
     super::close(list);
     list
+}
+
+/// A recording's list of ours, whose host the submission took and ran: back
+/// in the pool (it is closed, as [`back_list`] expects).
+pub(crate) fn give_back_list(this: usize) {
+    held(&BACKS).push(this);
 }
 
 fn start() {
@@ -428,7 +467,7 @@ plain! {
     GRAPHICS_CONSTANT graphics_constant = state::graphics_constant, (slot: u32, value: u32, offset: u32);
     COMPUTE_VIEW compute_view = state::compute_view, (slot: u32, address: u64);
     GRAPHICS_VIEW graphics_view = state::graphics_view, (slot: u32, address: u64);
-    SET_PIPELINE set_pipeline = super::set_pipeline, (pipeline: This);
+    SET_PIPELINE set_pipeline_record = super::set_pipeline, (pipeline: This);
     DRAW draw = state::draw, (vertices: u32, instances: u32, first: u32, first_instance: u32);
     DRAW_INDEXED draw_indexed = state::draw_indexed, (indices: u32, instances: u32, first: u32, base: i32, first_instance: u32);
     DISPATCH dispatch = state::dispatch, (x: u32, y: u32, z: u32);
@@ -447,6 +486,14 @@ plain! {
     WAIT_VALUE wait_value = super::wait_value, (address: u64, comparison: u32, reference: u64);
     WAIT_VALUE64 wait_value64 = super::wait_value64, (address: u64, comparison: u32, reference: u64);
     SYNC sync = super::sync, (flags: u32, control: u32, address: u64, size: u64);
+}
+
+/// `set_pipeline` records the bind and starts the pipeline's host compile at
+/// once: a bound pipeline is drawn soon, so its compile starts at bind, not at
+/// the draw that needs it.
+extern "system" fn set_pipeline(this: This, pipeline: This) {
+    crate::pipeline::prefetch(pipeline);
+    set_pipeline_record(this, pipeline);
 }
 
 const fn after(n: u64) -> u64 {
@@ -880,7 +927,7 @@ mod tests {
     #[test]
     fn a_stream_gives_back_what_was_written() {
         let mut f = Front::default();
-        f.recording = Some(Arc::new(Recording::new(0)));
+        f.recording = Some(Arc::new(Recording::new(0, 0)));
         f.put(Plain::DRAW_INDEXED as u64, &[3, 1, 0, Word::word(-7i32), 5]);
         let viewport = [1.0f32, 2.0, 3.0, 4.0, 0.0, 1.0];
         f.put_with(VIEWPORTS, &[1], &[bytes_of(viewport.as_ptr(), 6)]);

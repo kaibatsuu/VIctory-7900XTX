@@ -196,6 +196,10 @@ pub(crate) struct Detached {
     host: crate::host::HostList,
     _uploads: Vec<Upload>,
     _state: crate::draw::State,
+    /// With `VICTORY_LIST_RELEASE=1`, the thin recording's list of ours this
+    /// host list was taken from: given back once it has run
+    /// ([`crate::list::thin::give_back_list`]).
+    release: Option<usize>,
 }
 
 #[cfg(windows)]
@@ -266,14 +270,16 @@ fn fresh_list() -> Option<crate::host::HostList> {
 /// kept for [`fresh_list`].
 #[cfg(windows)]
 pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
-    if !pools() {
-        return;
-    }
-    for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
+    for (i, Detached { host, _uploads, _state, release }) in lists.into_iter().enumerate() {
+        // The thin recording's list of ours, whose host this was: back in its
+        // pool now that the submission has run.
+        if let Some(back) = release {
+            thin::give_back_list(back);
+        }
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !pools() || !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -376,7 +382,7 @@ pub(crate) type Parts = Vec<(Vec<ValueWait>, Vec<Detached>, Vec<usize>)>;
 /// it has one part and that part is in the entry being filled; otherwise
 /// the second naming is dropped (logged once).
 #[cfg(windows)]
-pub(crate) fn detach_parts(lists: &[This]) -> Parts {
+pub(crate) fn detach_parts(lists: &[This], release: bool) -> Parts {
     let mut parts: Parts = vec![(Vec::new(), Vec::new(), Vec::new())];
     // The lists taken: where its one host list is (entry, place), or none
     // for a list of several parts.
@@ -423,6 +429,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
                         host: part.host,
                         _uploads: Vec::new(),
                         _state: Default::default(),
+                        release: None,
                     },
                 )
             })
@@ -433,6 +440,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
                 host,
                 _uploads: uploads,
                 _state: state,
+                release: release.then_some(this as usize),
             },
         ));
         let mut last = None;
@@ -458,7 +466,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
 /// submission names it) and leaves each list a new, closed host list for
 /// its next reset: what was taken, and which of them run in what order.
 #[cfg(windows)]
-pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
+pub(crate) fn detach(lists: &[This], release: bool) -> (Vec<Detached>, Vec<usize>) {
     let mut taken: Vec<(This, Detached)> = Vec::new();
     let mut order = Vec::new();
     for &this in lists {
@@ -495,6 +503,7 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
                 host,
                 _uploads: uploads,
                 _state: state,
+                release: release.then_some(this as usize),
             },
         ));
     }
@@ -580,6 +589,8 @@ fn new_list(
 fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
     #[cfg(not(windows))]
     let _ = thin;
+    #[cfg(windows)]
+    crate::pipeline::prefetch(pipeline);
     let list = Box::new(List {
         object: match (crate::device::newer(), thin) {
             (true, false) => Object::new(&NEWER_LIST_FUNCTIONS),
@@ -612,8 +623,7 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
             let mut state = crate::draw::State::default();
             state.set_pipeline(pipeline);
             std::sync::Mutex::new(state)
-        },
-        #[cfg(windows)]
+        },        #[cfg(windows)]
         earlier: Vec::new(),
         #[cfg(windows)]
         gate: Vec::new(),
@@ -685,6 +695,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         state.reset(pipeline);
     });
     crate::pipeline::bound(pipeline);
+    crate::pipeline::prefetch(pipeline);
     #[cfg(not(windows))]
     let _ = this;
     S_OK
@@ -1538,6 +1549,7 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
 
 extern "system" fn set_pipeline(this: This, pipeline: This) {
     crate::pipeline::bound(pipeline);
+    crate::pipeline::prefetch(pipeline);
     #[cfg(windows)]
     with_state(this, |_, state| state.set_pipeline(pipeline));
     #[cfg(not(windows))]

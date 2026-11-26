@@ -17,6 +17,7 @@ use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
+use super::mouse::MouseInput;
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
@@ -113,6 +114,30 @@ trait Source: Send {
     fn keys(&mut self) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// What the captured mouse adds to the pad the title reads.
+    fn mouse(&mut self) -> MouseInput {
+        MouseInput::default()
+    }
+}
+
+/// The mouse on top of a pad: right stick added (capped), buttons pull the
+/// triggers (left button the right trigger) and click the right stick.
+fn with_mouse(mut pad: PadState, m: &MouseInput) -> PadState {
+    if *m == MouseInput::default() {
+        return pad;
+    }
+    pad.right_x = (pad.right_x + m.right_x).clamp(-1.0, 1.0);
+    pad.right_y = (pad.right_y + m.right_y).clamp(-1.0, 1.0);
+    if m.left {
+        pad.right_trigger = 1.0;
+    }
+    if m.right {
+        pad.left_trigger = 1.0;
+    }
+    if m.middle {
+        pad.buttons |= RIGHT_STICK;
+    }
+    pad
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -430,12 +455,14 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, mouse) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            (pads, source.keys(), source.mouse())
         };
-        let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
+        let events = self
+            .state()
+            .poll(&self.devices, self.one_pad, pads, keys, mouse);
         self.deliver(events);
     }
 
@@ -479,22 +506,28 @@ impl State {
         &mut self,
         devices: &[Device; DEVICES],
         one_pad: bool,
-        pads: [Option<PadState>; PADS],
+        mut pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: MouseInput,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         if one_pad {
             let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            let pad = with_mouse(pad, &mouse);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
         }
         let any_pad = pads.iter().any(Option::is_some);
+        // The mouse goes to the first host pad, else to the stand-in.
+        if let Some(pad) = pads.iter_mut().flatten().next() {
+            *pad = with_mouse(*pad, &mouse);
+        }
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| Value::Pad(with_mouse(fallback(&keys), &mouse)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1235,6 +1268,10 @@ mod host {
                 .collect()
         }
 
+        fn mouse(&mut self) -> MouseInput {
+            crate::modules::mouse::take()
+        }
+
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             let speeds = XINPUT_VIBRATION {
                 wLeftMotorSpeed: low,
@@ -1334,6 +1371,7 @@ mod tests {
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: MouseInput,
         rumble: Vec<(usize, u16, u16)>,
     }
 
@@ -1345,6 +1383,9 @@ mod tests {
         }
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
+        }
+        fn mouse(&mut self) -> MouseInput {
+            self.0.lock().unwrap().mouse
         }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             self.0.lock().unwrap().rumble.push((slot, low, high));
@@ -1710,5 +1751,76 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+
+    #[test]
+    fn the_mouse_adds_to_the_right_stick_and_pulls_triggers() {
+        let pad = PadState {
+            right_x: 0.9,
+            ..Default::default()
+        };
+        let m = MouseInput {
+            right_x: 0.5,
+            right_y: -0.3,
+            left: true,
+            right: false,
+            middle: true,
+        };
+        let out = with_mouse(pad, &m);
+        assert_eq!(out.right_x, 1.0);
+        assert_eq!(out.right_y, -0.3);
+        assert_eq!(out.right_trigger, 1.0);
+        assert_eq!(out.left_trigger, 0.0);
+        assert_eq!(out.buttons & RIGHT_STICK, RIGHT_STICK);
+        // No mouse: the pad unchanged.
+        assert_eq!(with_mouse(pad, &MouseInput::default()), pad);
+    }
+
+    #[test]
+    fn mouse_feeds_the_one_pad_and_host_or_fallback_pad() {
+        let mouse = MouseInput {
+            right_x: 0.4,
+            right_y: -0.6,
+            left: true,
+            right: true,
+            middle: true,
+        };
+
+        // one_pad = true (default): mouse feeds the combined FALLBACK pad even when a host pad is connected.
+        let (hub, host) = fake_with(true);
+        {
+            let mut h = host.lock().unwrap();
+            h.pads[1] = Some(PadState {
+                buttons: A,
+                ..Default::default()
+            });
+            h.mouse = mouse;
+        }
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        let p = pad(r);
+        release(r);
+        assert_eq!(p.buttons, A | RIGHT_STICK);
+        assert_eq!((p.right_x, p.right_y), (0.4, -0.6));
+        assert_eq!((p.left_trigger, p.right_trigger), (1.0, 1.0));
+
+        // one_pad = false: mouse feeds FALLBACK when no host pad is connected,
+        // and the first connected host pad otherwise.
+        let (hub, host) = fake_with(false);
+        host.lock().unwrap().mouse = mouse;
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        let p = pad(r);
+        release(r);
+        assert_eq!(p.buttons, RIGHT_STICK);
+        assert_eq!((p.right_x, p.right_y), (0.4, -0.6));
+
+        host.lock().unwrap().pads[2] = Some(PadState::default());
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 2).unwrap();
+        let p = pad(r);
+        release(r);
+        assert_eq!(p.buttons, RIGHT_STICK);
+        assert_eq!((p.right_x, p.right_y), (0.4, -0.6));
     }
 }

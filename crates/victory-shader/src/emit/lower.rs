@@ -1561,6 +1561,37 @@ pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
     result
 }
 
+/// The mnemonics named in `VICTORY_DISABLE_MNEMONIC` (comma-separated), for
+/// the offline bisect's child processes ([`super::translate`]); the run path
+/// passes its shader's culprit explicitly ([`with_disabled_mnemonics`]).
+pub(super) fn disabled_from_env() -> Vec<String> {
+    std::env::var("VICTORY_DISABLE_MNEMONIC")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+thread_local! {
+    /// The mnemonics being lowered as no-ops in this thread's current
+    /// translation ([`with_disabled_mnemonics`]): one shader's fallback
+    /// applies to it alone, not to every shader the process translates.
+    static DISABLED_MNEMONICS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` with the mnemonics of `disabled` lowered as no-ops (each writes
+/// 0 to its destination registers): the driver-crash bisect's fallback.
+/// Scoped to `f` and to this thread, so the run path translates one shader
+/// with its culprit while the others stay as they are.
+pub(super) fn with_disabled_mnemonics<R>(disabled: &[String], f: impl FnOnce() -> R) -> R {
+    let before = DISABLED_MNEMONICS.replace(disabled.to_vec());
+    let result = f();
+    DISABLED_MNEMONICS.set(before);
+    result
+}
+
 thread_local! {
     /// Whether a mask operation on numbers read as data is the number it
     /// computes ([`with_mask_ops_on_numbers`]).
@@ -5880,6 +5911,19 @@ impl<'a> Lower<'a> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();
+        if DISABLED_MNEMONICS.with(|d| d.borrow().iter().any(|m| m == name)) {
+            // No-op: write 0 to every register dword the instruction writes,
+            // so its result is well-defined for whoever reads it. VALU has no
+            // side effects, so that alone is complete there; for a consuming
+            // load or sample the missing read reads as 0, and a skipped export
+            // just drops its output — each keeps the shader compilable, which
+            // is what the bisect counts as "made".
+            let zero = self.s.m.i32(0);
+            for &(_, v) in &inst.writes {
+                self.vals.insert(v, Val::I32(zero));
+            }
+            return Ok(());
+        }
         self.local_ok = name.starts_with("s_bcnt1_i32_")
             || name.starts_with("s_ff1_i32_")
             || name.starts_with("v_mbcnt_");
@@ -8391,6 +8435,25 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
     }
 
+    /// The mnemonics named in `VICTORY_FALLBACK_MNEMONIC` (comma-separated):
+    /// each is lowered with its semantically-correct-but-simpler emission
+    /// where one exists (e.g. `v_fma_f32` fused as a separate multiply and
+    /// add), so a driver bug in the normal emission is avoided without losing
+    /// the instruction's meaning. Mnemonics without such a fallback are
+    /// unchanged.
+    fn fallback_mnemonics() -> &'static [String] {
+        static FALLBACK: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        FALLBACK.get_or_init(|| {
+            std::env::var("VICTORY_FALLBACK_MNEMONIC")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+    }
+
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
@@ -8846,9 +8909,16 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_fma_f32" | "v_fmaak_f32" | "v_fmamk_f32" => {
-                // shortcut: DXIL has no fused f32 multiply-add; FMad lets the driver fuse.
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
-                let r = self.fmad(a, bb, cc);
+                let r = if Self::fallback_mnemonics().iter().any(|m| m == name) {
+                    // Safe fallback: a separate multiply and add, not the
+                    // fused form the host driver's compiler crashes on.
+                    let mul = self.s.m.bin(c, Bin::Mul, a, bb);
+                    self.s.m.bin(c, Bin::Add, mul, cc)
+                } else {
+                    // shortcut: DXIL has no fused f32 multiply-add; FMad lets the driver fuse.
+                    self.fmad(a, bb, cc)
+                };
                 float(self, r)
             }
             "v_div_scale_f32" => {

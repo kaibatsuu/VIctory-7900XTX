@@ -62,6 +62,26 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// Whether the machine's primary hardware adapter is AMD, found without
+/// making a device, so the compiler workaround can be set before the shader
+/// cache is opened (its key reads `shader_opt` before any device is made).
+pub fn detect_amd() -> bool {
+    // SAFETY: plain DXGI queries.
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return false;
+        };
+        let mut i = 0u32;
+        while let Ok(adapter) = factory.EnumAdapters1(i) {
+            if let Ok(desc) = adapter.GetDesc1() && desc.Flags & 2 == 0 {
+                return desc.VendorId == 0x1002;
+            }
+            i += 1;
+        }
+        false
+    }
+}
+
 fn software(desc: &DXGI_ADAPTER_DESC1) -> bool {
     desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
         || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
@@ -166,7 +186,6 @@ fn an_explicit_adapter_matches_an_index_or_name() {
     assert!(!adapter_matches("nvidia", 0, integrated));
     assert!(!adapter_matches("", 0, integrated));
 }
-
 impl Host {
     /// The preferred hardware adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
@@ -207,6 +226,21 @@ impl Host {
                 return Err(format!("the device supports SM {:#x} only", sm.0));
             }
             Ok(Host { device })
+        }
+    }
+
+    /// The driver's build number, as the system counts it (0: not known).
+    /// Keys the pipeline-fallback cache, so a driver update re-checks it.
+    pub fn driver_version(&self) -> i64 {
+        // SAFETY: plain DXGI queries.
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+                return 0;
+            };
+            let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter>(self.device.GetAdapterLuid()) else {
+                return 0;
+            };
+            adapter.CheckInterfaceSupport(&IDXGIDevice::IID).unwrap_or(0)
         }
     }
 

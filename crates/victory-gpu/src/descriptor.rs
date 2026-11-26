@@ -1131,8 +1131,9 @@ const PLACED_ADDRESS_BITS: u32 = 40;
 const SHAPES: usize = 1 << (62 - PLACED_ADDRESS_BITS);
 
 /// A view of placed memory without its address: whether it is unordered
-/// access, the resource description, and the view's words but the two that
-/// hold the address (10 and 11).
+/// access, the resource description (its words but the two of its layout's
+/// filler, 1 and 13), and the view's words but the two that hold the address
+/// (10 and 11).
 type Shape = (bool, [u32; 14], [u32; 14]);
 
 /// Whether constant buffer views and views of placed memory are named whole
@@ -1189,8 +1190,17 @@ fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, 
     let mut rest = [0u32; 14];
     rest[..10].copy_from_slice(&desc[..10]);
     rest[10..].copy_from_slice(&desc[12..]);
+    // Words 1 and 13 of the resource description are the filler of its
+    // layout (after the dimension, and at the end): the title leaves there
+    // what its stack held, so two views of one texture that differed only
+    // in them would each be a shape of their own. They are not part of what
+    // a texture is (`crate::resource::texture_at` leaves them out of its
+    // key too).
+    let mut key = *resource;
+    key[1] = 0;
+    key[13] = 0;
     (
-        (unordered, *resource, rest),
+        (unordered, key, rest),
         u64::from(desc[10]) | u64::from(desc[11]) << 32,
     )
 }
@@ -1984,8 +1994,11 @@ mod tests {
         let null = std::ptr::null();
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;
-        // A resource description and a view no other test uses.
-        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+        // A resource description and a view no other test uses (its words 1
+        // and 13, the layout's filler, are zero so the view reads back whole).
+        let mut resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+        resource[1] = 0;
+        resource[13] = 0;
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
@@ -2024,6 +2037,40 @@ mod tests {
         assert_eq!(words(at), words(other.as_ptr() as u64));
         create_cbv(null, &[0x140, 6, 512, 0], other.as_ptr() as u64);
         assert_ne!(words(at), words(other.as_ptr() as u64));
+    }
+
+    /// Words 1 and 13 of the resource description are the filler of its
+    /// layout: the title leaves its stack there, so views of one texture
+    /// that differ only in them must still share one shape (the shape
+    /// leaves the filler out, as `crate::resource::texture_at` leaves it
+    /// out of the resource key).
+    #[test]
+    fn placed_views_share_one_shape_whatever_the_filler() {
+        if !inline() {
+            return;
+        }
+        let null = std::ptr::null();
+        let slots = [0u64; 4];
+        let at = slots.as_ptr() as u64;
+        // A resource description and a view no other test uses; words 1 and
+        // 13 are the filler and vary below, the rest is the texture.
+        let mut resource: [u32; 14] = std::array::from_fn(|k| 0x7ee0_0000 + k as u32);
+        let mut desc: [u32; 16] = std::array::from_fn(|k| 0x8a80_0000 + k as u32);
+        let address = 0xd_4940_0000u64;
+        (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+        let mut base = resource;
+        base[1] = 0;
+        base[13] = 0;
+        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == base).count();
+        for n in 0..1_000u32 {
+            resource[1] = n;
+            resource[13] = n ^ 0xaaaa_0000;
+            create_placed_srv(null, &resource, &desc, at);
+            // The filler is left out of the shape, so the view reads back
+            // with it blank (it is nothing of the texture).
+            assert_eq!(view(at), Some(View::Placed(false, base, desc)));
+        }
+        assert_eq!(shapes(), 1, "one shape for 1,000 placed views that differ only in filler");
     }
 
     /// A released resource's views go stale; the same view of a new

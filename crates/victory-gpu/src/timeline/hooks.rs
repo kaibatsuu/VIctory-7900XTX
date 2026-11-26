@@ -251,9 +251,212 @@ fn find_real() {
     }
 }
 
+/// `VICTORY_SLEEP_COUNT=1`: the title's `Sleep`, `SleepEx` and
+/// `SwitchToThread` are bound to counting wrappers for the whole run (the
+/// timeline's wrappers then leave those three alone). A zero-millisecond
+/// sleep gives the rest of the time slice to a thread ready on that
+/// processor, or returns at once: each is timed, and every five seconds a
+/// line says per frame how many there were, the time inside them, how many
+/// waited long (another thread ran meanwhile), and the threads that made
+/// most of them (ids as `VICTORY_PROFILE` names threads). At the first bind,
+/// how long one `pause` takes on this processor: the title's `mwaitx` spin
+/// loops are patched to it (`victory_loader::console_insn`).
+mod sleeps {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+    use std::sync::{Mutex, Once, OnceLock};
+    use std::time::{Duration, Instant};
+
+    fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_SLEEP_COUNT").is_some_and(|v| v == "1"))
+    }
+
+    /// The real `Sleep`, `SleepEx`, `SwitchToThread`.
+    static REAL: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+    /// Zero-millisecond sleeps by how long the call took (under 10 µs, under
+    /// 100 µs, under 1 ms, longer): calls, ns.
+    static ZERO: [[AtomicU64; 2]; 4] = [const { [const { AtomicU64::new(0) }; 2] }; 4];
+    /// All zero-millisecond sleeps, for when a line is looked for.
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    /// Sleeps of a millisecond or more: calls, ns.
+    static OTHER: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    /// `SwitchToThread`: calls, ns, those that gave the processor away.
+    static SWITCH: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    /// Zero-millisecond sleeps by thread: id, calls, ns.
+    static THREADS: [[AtomicU64; 3]; 64] = [const { [const { AtomicU64::new(0) }; 3] }; 64];
+
+    /// Our wrapper for the title's import `name`, whose real function is at
+    /// `address`; `None` if it is not counted.
+    pub(super) fn bind(name: &str, address: usize) -> Option<usize> {
+        if !on() || address == 0 {
+            return None;
+        }
+        let (i, ours) = match name {
+            "Sleep" => (0, sleep as *const () as usize),
+            "SleepEx" => (1, sleep_ex as *const () as usize),
+            "SwitchToThread" => (2, switch as *const () as usize),
+            _ => return None,
+        };
+        REAL[i].store(address, Relaxed);
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            tracing::info!(
+                pause_ns = format_args!("{:.1}", pause_ns()),
+                "the title's Sleep, SleepEx and SwitchToThread are counted (VICTORY_SLEEP_COUNT); pause_ns: one pause on this processor"
+            );
+        });
+        tracing::info!(name, "a title import counted (VICTORY_SLEEP_COUNT)");
+        Some(ours)
+    }
+
+    /// One `pause`, ns: the best of five runs of 100,000.
+    fn pause_ns() -> f64 {
+        (0..5)
+            .map(|_| {
+                let t = Instant::now();
+                for _ in 0..100_000 {
+                    std::hint::spin_loop();
+                }
+                t.elapsed().as_secs_f64() * 1e9 / 100_000.0
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    unsafe extern "system" fn sleep(ms: u32) {
+        // SAFETY: the real function, stored before this wrapper was handed out.
+        let real = unsafe { std::mem::transmute::<usize, unsafe extern "system" fn(u32)>(REAL[0].load(Relaxed)) };
+        let t0 = Instant::now();
+        // SAFETY: the caller's own call.
+        unsafe { real(ms) };
+        done(ms, t0.elapsed());
+    }
+
+    unsafe extern "system" fn sleep_ex(ms: u32, alertable: i32) -> u32 {
+        // SAFETY: as in `sleep`.
+        let real = unsafe { std::mem::transmute::<usize, unsafe extern "system" fn(u32, i32) -> u32>(REAL[1].load(Relaxed)) };
+        let t0 = Instant::now();
+        // SAFETY: the caller's own call.
+        let result = unsafe { real(ms, alertable) };
+        done(ms, t0.elapsed());
+        result
+    }
+
+    unsafe extern "system" fn switch() -> i32 {
+        // SAFETY: as in `sleep`.
+        let real = unsafe { std::mem::transmute::<usize, unsafe extern "system" fn() -> i32>(REAL[2].load(Relaxed)) };
+        let t0 = Instant::now();
+        // SAFETY: the caller's own call.
+        let result = unsafe { real() };
+        let ns = t0.elapsed().as_nanos() as u64;
+        SWITCH[0].fetch_add(1, Relaxed);
+        SWITCH[1].fetch_add(ns, Relaxed);
+        SWITCH[2].fetch_add(u64::from(result != 0), Relaxed);
+        result
+    }
+
+    fn done(ms: u32, took: Duration) {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        // SAFETY: plain queries of this thread's own.
+        let error = unsafe { GetLastError() };
+        let ns = took.as_nanos() as u64;
+        if ms == 0 {
+            let bucket = if ns < 10_000 {
+                0
+            } else if ns < 100_000 {
+                1
+            } else if ns < 1_000_000 {
+                2
+            } else {
+                3
+            };
+            ZERO[bucket][0].fetch_add(1, Relaxed);
+            ZERO[bucket][1].fetch_add(ns, Relaxed);
+            // SAFETY: a plain query.
+            let id = u64::from(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() });
+            let mut i = (id as usize).wrapping_mul(0x9E37_79B9) % THREADS.len();
+            for _ in 0..THREADS.len() {
+                let t = &THREADS[i];
+                let there = t[0].compare_exchange(0, id, Relaxed, Relaxed).unwrap_or_else(|there| there);
+                if there == 0 || there == id {
+                    t[1].fetch_add(1, Relaxed);
+                    t[2].fetch_add(ns, Relaxed);
+                    break;
+                }
+                i = (i + 1) % THREADS.len();
+            }
+            if CALLS.fetch_add(1, Relaxed) % 4096 == 0 {
+                maybe_line();
+            }
+        } else {
+            OTHER[0].fetch_add(1, Relaxed);
+            OTHER[1].fetch_add(ns, Relaxed);
+            maybe_line();
+        }
+        // SAFETY: as above.
+        unsafe { SetLastError(error) };
+    }
+
+    /// A line if five seconds have passed since the last; never waited for.
+    fn maybe_line() {
+        static LAST: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
+        let Ok(mut last) = LAST.try_lock() else { return };
+        let (now, frame) = (Instant::now(), crate::frame::current());
+        let (since, from) = *last.get_or_insert((now, frame));
+        if now.duration_since(since) < Duration::from_secs(5) {
+            return;
+        }
+        *last = Some((now, frame));
+        drop(last);
+        line(now.duration_since(since), frame.saturating_sub(from));
+    }
+
+    fn line(took: Duration, frames: u64) {
+        let f = frames.max(1) as f64;
+        let take = |a: &AtomicU64| a.swap(0, Relaxed);
+        let z: Vec<(u64, u64)> = ZERO.iter().map(|b| (take(&b[0]), take(&b[1]))).collect();
+        let calls: u64 = z.iter().map(|b| b.0).sum();
+        let ns: u64 = z.iter().map(|b| b.1).sum();
+        let (other_calls, other_ns) = (take(&OTHER[0]), take(&OTHER[1]));
+        let (switches, switch_ns, yielded) = (take(&SWITCH[0]), take(&SWITCH[1]), take(&SWITCH[2]));
+        let mut threads: Vec<(u64, u64, u64)> = THREADS
+            .iter()
+            .map(|t| (t[0].load(Relaxed), take(&t[1]), take(&t[2])))
+            .filter(|t| t.1 > 0)
+            .collect();
+        threads.sort_unstable_by_key(|t| std::cmp::Reverse(t.2));
+        let top: Vec<String> = threads
+            .iter()
+            .take(4)
+            .map(|t| format!("thread {} {:.0} calls {:.2} ms", t.0, t.1 as f64 / f, t.2 as f64 / 1e6 / f))
+            .collect();
+        tracing::info!(
+            "Sleep(0) per frame ({} frames in {:.1} s): {:.0} calls, {:.2} ms inside ({:.2} us each); by length: {:.0} under 10 us, {:.0} under 100 us, {:.1} under 1 ms, {:.2} longer ({:.2} ms of them); by thread: {}; longer sleeps {:.1} calls {:.2} ms; SwitchToThread {:.0} calls {:.2} ms, {:.0} gave the processor away (VICTORY_SLEEP_COUNT)",
+            frames,
+            took.as_secs_f64(),
+            calls as f64 / f,
+            ns as f64 / 1e6 / f,
+            if calls > 0 { ns as f64 / 1e3 / calls as f64 } else { 0.0 },
+            z[0].0 as f64 / f,
+            z[1].0 as f64 / f,
+            z[2].0 as f64 / f,
+            z[3].0 as f64 / f,
+            z[3].1 as f64 / 1e6 / f,
+            top.join(", "),
+            other_calls as f64 / f,
+            other_ns as f64 / 1e6 / f,
+            switches as f64 / f,
+            switch_ns as f64 / 1e6 / f,
+            yielded as f64 / f
+        );
+    }
+}
+
 /// What the title's import `name`, found at `address`, is bound to: the
 /// address itself, or our wrapper of it.
 pub fn import(name: &str, address: usize) -> usize {
+    if let Some(ours) = sleeps::bind(name, address) {
+        return ours;
+    }
     if !arm() {
         return address;
     }

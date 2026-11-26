@@ -85,6 +85,9 @@ pub fn run(
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
     let title_dir = exe.parent().unwrap_or(Path::new("."));
+    if execute {
+        crate::launch_warm::warm_before_launch(&cfg, title_dir);
+    }
     // A missing manifest leaves id 0 and no storage quota.
     let manifest =
         std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
@@ -239,6 +242,7 @@ pub fn run(
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     victory_hle::known_pipelines::flush();
+    victory_hle::save_pipeline_cache();
     println!("title exited with {code}");
     Ok(())
 }

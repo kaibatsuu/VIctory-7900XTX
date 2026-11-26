@@ -296,6 +296,74 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
     }
 }
 
+/// Serialises one pipeline for [`make_pending`]: the shader containers and
+/// the graphics state. The run sends this to a canary child that makes the
+/// pipeline, so a driver crash ends the child, not the run.
+pub(crate) fn pending(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.push(shaders.len() as u8);
+    for s in shaders {
+        let stage = STAGES.iter().position(|&x| x == s.stage).unwrap_or(0) as u8;
+        bytes.push(stage);
+        bytes.extend((s.container.len() as u32).to_le_bytes());
+        bytes.extend(&s.container);
+    }
+    bytes.push(u8::from(graphics.is_some()));
+    if let Some(g) = graphics {
+        g.put(&mut bytes);
+    }
+    bytes
+}
+
+/// Makes the host pipeline of one [`pending`] serialisation, in this process
+/// (a `victory canary-worker` child of a run with
+/// `VICTORY_PIPELINE_ISOLATE=1`). Whether it has a host pipeline; the
+/// pipeline object itself is let go (the run makes its own after this canary
+/// tells it the compile does not crash).
+///
+/// `fallback` (`(shader hash, mnemonic)`, from the worker's framed request)
+/// is the run's driver-crash fallback for one of the shaders, made as the
+/// run will make it ([`HostPipeline::new_with`]). `VICTORY_DISABLE_MNEMONIC`
+/// does not do it: the run's translation takes its disabled set as an
+/// argument and reads no environment, and the shader cache would serve the
+/// normal translation the run cached; so the fallback's own check crashed
+/// like the original (run combined-run4, compute f16876929fa64f9f).
+pub fn make_pending(bytes: &[u8], fallback: Option<(&str, &str)>) -> bool {
+    let Some((&count, mut rest)) = bytes.split_first() else {
+        return false;
+    };
+    let mut shaders = Vec::new();
+    for _ in 0..count {
+        let Some((&stage, after)) = rest.split_first() else {
+            return false;
+        };
+        let Some(len) = after.get(..4).map(|h| u32::from_le_bytes(h.try_into().expect("4 bytes")) as usize)
+        else {
+            return false;
+        };
+        let Some(container) = after.get(4..).and_then(|r| r.get(..len)) else {
+            return false;
+        };
+        let Some(stage) = STAGES.get(usize::from(stage)) else {
+            return false;
+        };
+        shaders.push(super::shader(stage, container));
+        rest = &after[4 + len..];
+    }
+    let Some((&has_graphics, after)) = rest.split_first() else {
+        return false;
+    };
+    let graphics = if has_graphics == 0 {
+        None
+    } else {
+        let Some(g) = GraphicsState::get(after) else {
+            return false;
+        };
+        Some(Box::new(g))
+    };
+    HostPipeline::new_with(&shaders, graphics.as_deref(), fallback).is_some()
+}
+
 #[allow(clippy::type_complexity)]
 fn parse(
     entry: &[u8],

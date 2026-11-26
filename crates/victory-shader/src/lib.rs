@@ -34,6 +34,43 @@ pub use native::{
     HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, native_programs,
 };
 
+/// Whether a console program can store to buffer memory (the first) and
+/// through raw addresses (the second), from one decode of its code. The
+/// translator's `stores` and `stores_by_address`, fused so a shader cache hit
+/// decodes once, or not at all.
+pub fn analyze_stores(program: &NativeProgram) -> (bool, bool) {
+    use gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        // Code that does not decode is taken as storing both ways.
+        return (true, true);
+    };
+    let mut stores = false;
+    let mut by_address = false;
+    for i in code.iter() {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Mubuf | Encoding::Mtbuf | Encoding::Smem | Encoding::Flat | Encoding::Global => {
+                if name.is_none_or(|n| (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")) {
+                    stores = true;
+                    if matches!(i.encoding, Encoding::Flat | Encoding::Global) {
+                        by_address = true;
+                    }
+                }
+            }
+            Encoding::Sop1 => {
+                if name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")) {
+                    stores = true;
+                }
+            }
+            _ => {}
+        }
+        if stores && by_address {
+            break;
+        }
+    }
+    (stores, by_address)
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ShaderError {
     #[error("not a DXBC container")]

@@ -29,6 +29,8 @@ pub use victory_gpu::replay;
 
 #[cfg(windows)]
 pub use victory_gpu::pipeline::known as known_pipelines;
+pub use victory_gpu::pipeline::canary_worker;
+pub use victory_gpu::pipeline::save_pipeline_cache;
 /// Renderer port #2's switch and marks, for the launcher.
 #[cfg(windows)]
 pub use victory_gpu::port_descriptors;

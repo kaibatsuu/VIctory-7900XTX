@@ -562,7 +562,7 @@ fn translate(
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
     let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
-    translate_programs(&container, programs, &example, t, checks);
+    translate_programs(&container, &bytes, programs, &example, t, checks);
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);
@@ -575,7 +575,7 @@ fn translate(
     }
 }
 
-fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
+fn translate_programs(container: &Container, bytes: &[u8], programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
     for p in programs {
         t.programs += 1;
         match victory_shader::spill::build(&p) {
@@ -643,7 +643,8 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                         Ok(shader) => {
                             census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;
-                            check(shader, t, checks, label);
+                            let mnemonics = valu_mnemonics(&program);
+                            check(shader, bytes, &mnemonics, t, checks, label);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
                             .fail(format!("emit: {what}"), || {
@@ -712,6 +713,8 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
 /// Validates an emitted shader if asked to.
 fn check(
     mut shader: emit::HostShader,
+    bytes: &[u8],
+    mnemonics: &[&'static str],
     t: &mut Tally,
     checks: &mut Checks,
     label: impl Fn() -> String,
@@ -739,11 +742,18 @@ fn check(
         );
     }
     if let Some((h, stub_ps)) = &checks.host {
-        let made = match shader.stage {
-            HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
-            HwStage::Cs => h.compute_pipeline(&shader).map(drop),
-            HwStage::Ms => h.mesh_pipeline(&shader, stub_ps).map(drop),
-            _ => host::stub_vs(&shader).and_then(|vs| h.pipeline(&vs, &shader).map(drop)),
+        let made = if isolate_pipelines() {
+            // The child re-translates the container and compiles its host
+            // pipeline; a driver crash ends the child, not this process, and
+            // is then bisected to the one mnemonic to disable.
+            isolated_compile(bytes, mnemonics)
+        } else {
+            match shader.stage {
+                HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
+                HwStage::Cs => h.compute_pipeline(&shader).map(drop),
+                HwStage::Ms => h.mesh_pipeline(&shader, stub_ps).map(drop),
+                _ => host::stub_vs(&shader).and_then(|vs| h.pipeline(&vs, &shader).map(drop)),
+            }
         };
         match made {
             Ok(()) => {
@@ -795,6 +805,298 @@ fn check(
             t.fail(format!("validator: {first}"), label);
         }
     }
+}
+
+/// `VICTORY_PIPELINE_ISOLATE=1`: `translate --pipelines` compiles each host
+/// pipeline in a child process, so a driver crash ends that process, not
+/// this one (it then reads as a refused pipeline).
+fn isolate_pipelines() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_ISOLATE").is_some_and(|v| v == "1"))
+}
+
+/// What came of a host pipeline compiled in a child process.
+#[cfg(windows)]
+enum CompileOutcome {
+    Made,
+    Refused(String),
+    Crashed,
+}
+
+/// Compiles `container`'s host pipeline in a child process (`pipeline-check`)
+/// with the mnemonics of `disabled` lowered as no-ops, and says what came of
+/// it. The container is written to a file in the cache folder, read back and
+/// re-translated by the child; the child inherits the environment, so its
+/// translation matches this one's.
+#[cfg(windows)]
+fn compile_in_child_with(container: &[u8], disabled: &[&str]) -> CompileOutcome {
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::AtomicU64;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    // The container is the title's own code: staged in the cache folder, not
+    // the system's temp folder (and the cache folder is where the run can
+    // write in a confined environment).
+    let dir = victory_core::Config::load()
+        .map(|c| c.cache_dir)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join(format!(
+        "victory-pipeline-{}-{}.cdxil",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    if let Err(e) = std::fs::write(&file, container) {
+        return CompileOutcome::Refused(format!(
+            "could not write the shader for the child process ({}): {e}",
+            file.display()
+        ));
+    }
+    let spawned = std::env::current_exe().ok().and_then(|exe| {
+        let mut cmd = Command::new(exe);
+        cmd.arg("pipeline-check")
+            .arg(&file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if !disabled.is_empty() {
+            cmd.env("VICTORY_DISABLE_MNEMONIC", disabled.join(","));
+        }
+        cmd.spawn().ok()
+    });
+    let outcome = match spawned {
+        Some(mut child) => match child.wait() {
+            Ok(status) if status.success() => CompileOutcome::Made,
+            Ok(status) if status.code() == Some(1) => CompileOutcome::Refused("host pipeline refused".into()),
+            Ok(_) => CompileOutcome::Crashed,
+            Err(e) => CompileOutcome::Refused(e.to_string()),
+        },
+        None => CompileOutcome::Refused("could not start the child process".into()),
+    };
+    let _ = std::fs::remove_file(&file);
+    outcome
+}
+
+/// The host driver's build number (0 if not known), for the fallback cache
+/// key: a driver update changes it, so a cached fallback is re-checked.
+#[cfg(windows)]
+fn driver_version() -> i64 {
+    static VERSION: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *VERSION.get_or_init(|| Host::new(false).map(|h| h.driver_version()).unwrap_or(0))
+}
+
+/// The fallback cache: one line per shader and driver, `<hash> <driver> <mnemonic>`.
+#[cfg(windows)]
+fn fallbacks_file() -> std::path::PathBuf {
+    victory_core::Config::load()
+        .map(|c| c.cache_dir.join("pipeline-fallbacks.txt"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("victory-pipeline-fallbacks.txt"))
+}
+
+/// The mnemonic cached for `shader` and `driver`, if there is one.
+#[cfg(windows)]
+fn read_fallback(shader: &str, driver: i64) -> Option<String> {
+    let text = std::fs::read_to_string(fallbacks_file()).ok()?;
+    for line in text.lines() {
+        let mut words = line.split(' ');
+        let (s, d, m) = (words.next()?, words.next()?, words.next()?);
+        if s == shader && d.parse::<i64>().ok() == Some(driver) {
+            return Some(m.to_owned());
+        }
+    }
+    None
+}
+
+/// Appends a fallback to the cache (a torn last line is ignored on read).
+#[cfg(windows)]
+fn write_fallback(shader: &str, driver: i64, mnemonic: &str) {
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(fallbacks_file())
+    {
+        let _ = writeln!(file, "{shader} {driver} {mnemonic}");
+    }
+}
+
+/// Compiles `container`'s host pipeline in a child, applying the fallback
+/// cached for this shader and driver, else bisecting a driver crash down to
+/// the one mnemonic whose disabling makes the pipeline (then caching it).
+/// `Ok` means a host pipeline was made, possibly with a mnemonic disabled.
+#[cfg(windows)]
+fn isolated_compile(container: &[u8], mnemonics: &[&'static str]) -> Result<(), String> {
+    let shader = blake3::hash(container).to_hex()[..16].to_owned();
+    let driver = driver_version();
+    if let Some(cached) = read_fallback(&shader, driver)
+        && matches!(compile_in_child_with(container, &[&cached]), CompileOutcome::Made)
+    {
+        println!("pipeline fallback (cached): disabled {cached}");
+        return Ok(());
+    }
+    match compile_in_child_with(container, &[]) {
+        CompileOutcome::Made => Ok(()),
+        CompileOutcome::Refused(why) => Err(why),
+        CompileOutcome::Crashed => match find_crash_mnemonic(container, mnemonics) {
+            Some(producer) => {
+                // The producer's no-op makes the pipeline, but the driver
+                // miscompiles the instruction that consumes its result; narrow
+                // to that consumer when one of its no-ops alone makes it too.
+                let culprit = find_consumer_mnemonic(container, producer).unwrap_or(producer);
+                write_fallback(&shader, driver, culprit);
+                println!("pipeline fallback: disabled {culprit} (the driver crashes on it)");
+                Ok(())
+            }
+            None => Err(
+                "the driver crashed compiling the host pipeline, and no single mnemonic's disabling makes it"
+                    .into(),
+            ),
+        },
+    }
+}
+
+/// Finds the mnemonic whose disabling alone makes the driver compile the
+/// shader: each of `mnemonics` is tried alone in a child process, and the
+/// first that yields a made pipeline is the culprit. A true binary search
+/// does not work here: disabling a compare or another control-flow mnemonic
+/// removes the culprit's code path and so also stops the crash, but yields a
+/// refused (or wrongly simplified) pipeline, not a made one — so only "made"
+/// counts, and that must be asked of each mnemonic alone. `None` if no single
+/// mnemonic's disabling makes the pipeline.
+#[cfg(windows)]
+fn find_crash_mnemonic(container: &[u8], mnemonics: &[&'static str]) -> Option<&'static str> {
+    mnemonics
+        .iter()
+        .copied()
+        .find(|&m| matches!(compile_in_child_with(container, &[m]), CompileOutcome::Made))
+}
+
+/// The IR programs of `container`, decoded and built, for the consumer
+/// bisect: which instructions read a producer's result.
+#[cfg(windows)]
+fn ir_programs(container: &[u8]) -> Vec<ir::Program> {
+    let Some(container) = Container::parse(container).ok() else {
+        return Vec::new();
+    };
+    let Some(dxil) = container
+        .part(FourCC::DXIL)
+        .or(container.part(FourCC::ACCC))
+        .map(|p| p.data)
+    else {
+        return Vec::new();
+    };
+    let Ok(programs) = native_programs(dxil) else {
+        return Vec::new();
+    };
+    programs
+        .into_iter()
+        .filter_map(|p| victory_shader::spill::build(&p).ok())
+        .collect()
+}
+
+/// The distinct mnemonics, in first-use order, of the instructions that read
+/// a value written by an instruction named `producer` — the consuming
+/// instructions the bisect narrows to (a buffer load, image sample, export,
+/// or a later VALU).
+#[cfg(windows)]
+fn consumer_mnemonics(programs: &[ir::Program], producer: &str) -> Vec<&'static str> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for program in programs {
+        let written: HashSet<ir::Value> = program
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| i.name() == producer)
+            .flat_map(|i| i.writes.iter().map(|&(_, v)| v))
+            .collect();
+        if written.is_empty() {
+            continue;
+        }
+        for inst in program.blocks.iter().flat_map(|b| &b.insts) {
+            if inst.reads.iter().any(|&(_, v)| written.contains(&v)) {
+                let name = inst.name();
+                if !name.is_empty() && name != producer && seen.insert(name) {
+                    out.push(name);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Narrows `producer` (a mnemonic whose no-op already makes the pipeline) to
+/// a consuming instruction's mnemonic whose own no-op also makes it, if one
+/// exists: the instruction the driver actually miscompiles. `None` when the
+/// producer has no readers, or none of their no-ops alone make the pipeline.
+#[cfg(windows)]
+fn find_consumer_mnemonic(container: &[u8], producer: &str) -> Option<&'static str> {
+    let programs = ir_programs(container);
+    consumer_mnemonics(&programs, producer)
+        .into_iter()
+        .find(|&m| matches!(compile_in_child_with(container, &[m]), CompileOutcome::Made))
+}
+
+/// The distinct VALU mnemonics of `program`, in first-use order: the set the
+/// driver-crash bisect disables one or several of.
+fn valu_mnemonics(program: &ir::Program) -> Vec<&'static str> {
+    let mut seen = HashSet::new();
+    program
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter(|i| {
+            matches!(i.fields, victory_shader::gfx10::Fields::Valu(_))
+                && !i.name().starts_with("v_interp_")
+        })
+        .map(|i| i.name())
+        .filter(|name| !name.is_empty() && seen.insert(*name))
+        .collect()
+}
+
+/// The child of `translate --pipelines` with `VICTORY_PIPELINE_ISOLATE=1`:
+/// re-translates one container and compiles its host pipeline. Exits 0 when
+/// the pipeline is made, 1 when the translator or the host refuses it; a
+/// driver crash ends this process with the crash's code.
+#[cfg(windows)]
+pub fn pipeline_check(file: &Path) -> Result<()> {
+    let bytes = std::fs::read(file).map_err(anyhow::Error::msg)?;
+    // The host settings the parent translated with; the child inherits the
+    // environment, and these globals are what the translate command set.
+    if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
+        victory_shader::emit::set_view_heap_limit(n);
+    }
+    if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
+        victory_shader::emit::set_host_max_wave(n);
+    }
+    if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
+        victory_shader::emit::set_host_max_wave(n);
+    }
+    victory_shader::emit::set_host_rdna(std::env::var_os("VICTORY_HOST_RDNA").is_some_and(|v| v == "1"));
+    let shader = match victory_shader::emit::translate(&bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    let host = match Host::new(false) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    let made = match shader.stage {
+        HwStage::Vs => host.pipeline(&shader, &host::stub_ps()).map(drop),
+        HwStage::Cs => host.compute_pipeline(&shader).map(drop),
+        HwStage::Ms => host.mesh_pipeline(&shader, &host::stub_ps()).map(drop),
+        _ => host::stub_vs(&shader).and_then(|vs| host.pipeline(&vs, &shader).map(drop)),
+    };
+    if let Err(e) = made {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// Emission counts of `stage`'s kind: 0 programs, 1 emitted, 2 validated,
@@ -992,6 +1294,55 @@ mod tests {
                 Some(victory_core::PolicyError::InsideRepo { .. })
             ),
             "{err}"
+        );
+    }
+
+    /// The consumer bisect names only the instructions that read the
+    /// producer's result, in first-use order, and never the producer itself.
+    #[cfg(windows)]
+    #[test]
+    fn consumer_mnemonics_finds_readers_of_a_producer() {
+        use victory_shader::gfx10::{Encoding, Fields, Instruction, Valu};
+        use victory_shader::ir::{self, Exit, Inst, Program, Reg, Value};
+
+        let producer = Inst {
+            // v_mov_b32 (VOP1).
+            machine: Instruction::new(0, Encoding::Vop1, 0x001, vec![0]),
+            fields: Fields::Valu(Valu::default()),
+            reads: vec![],
+            writes: vec![(Reg::V(0), Value(7))],
+        };
+        let consumer = Inst {
+            // buffer_load_dword (MUBUF): reads the producer's v0.
+            machine: Instruction::new(4, Encoding::Mubuf, 0x00c, vec![0]),
+            fields: Fields::Valu(Valu::default()),
+            reads: vec![(Reg::V(0), Value(7)), (Reg::S(2), Value(1))],
+            writes: vec![(Reg::V(4), Value(9))],
+        };
+        // Another producer-named instruction reading the same value: excluded
+        // because the bisect already narrowed past the producer mnemonic.
+        let same_name = Inst {
+            machine: Instruction::new(8, Encoding::Vop1, 0x001, vec![0]),
+            fields: Fields::Valu(Valu::default()),
+            reads: vec![(Reg::V(0), Value(7))],
+            writes: vec![(Reg::V(5), Value(10))],
+        };
+        let program = Program {
+            wave64: true,
+            vgprs: 8,
+            blocks: vec![ir::Block {
+                offset: 0,
+                preds: vec![],
+                phis: vec![],
+                insts: vec![producer, consumer, same_name],
+                exit: Exit::End,
+            }],
+            inputs: vec![],
+        };
+
+        assert_eq!(
+            super::consumer_mnemonics(&[program], "v_mov_b32"),
+            vec!["buffer_load_dword"]
         );
     }
 }

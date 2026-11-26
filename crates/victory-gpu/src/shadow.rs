@@ -1477,15 +1477,34 @@ struct Workers {
 /// most (0, the default: not at all): asleep, a thread is woken in 50 us and
 /// more, 95 times a frame.
 fn spin(there: impl Fn() -> bool) {
+    if there() {
+        return;
+    }
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| std::env::var("VICTORY_WIDE_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    let configured = *MOST.get_or_init(|| std::env::var("VICTORY_WIDE_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    #[cfg(feature = "diagnostics")]
+    let most = match crate::ab::pick("VICTORY_WIDE_SPIN") {
+        Some(false) => 0,
+        Some(true) => if configured > 0 { configured } else { 50 },
+        None => configured,
+    };
+    #[cfg(not(feature = "diagnostics"))]
+    let most = configured;
     if most == 0 {
         return;
     }
     let began = std::time::Instant::now();
-    while !there() && (began.elapsed().as_micros() as u64) < most {
-        for _ in 0..16 {
-            std::hint::spin_loop();
+    loop {
+        for _ in 0..4 {
+            for _ in 0..16 {
+                std::hint::spin_loop();
+            }
+            if there() {
+                return;
+            }
+        }
+        if (began.elapsed().as_micros() as u64) >= most {
+            break;
         }
     }
 }
@@ -1531,6 +1550,14 @@ fn workers() -> &'static Workers {
     workers
 }
 
+/// Completion gate for [`wide`]: workers decrement `remaining` atomically, and
+/// only the last worker to finish locks `finished` to wake the caller.
+struct Done {
+    remaining: std::sync::atomic::AtomicUsize,
+    finished: Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
 /// Runs `jobs` on the kept threads and on this one, and returns when all
 /// of them are done. The jobs copy and compare memory; they do not panic.
 fn wide(jobs: Vec<Job>) {
@@ -1540,9 +1567,14 @@ fn wide(jobs: Vec<Job>) {
         }
         return;
     }
+    let count = jobs.len();
     let workers = workers();
     let _wide = crate::timeline::span("work spread over threads");
-    let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+    let left = Arc::new(Done {
+        remaining: std::sync::atomic::AtomicUsize::new(count),
+        finished: Mutex::new(false),
+        cv: std::sync::Condvar::new(),
+    });
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
@@ -1550,15 +1582,21 @@ fn wide(jobs: Vec<Job>) {
             workers.there.fetch_add(1, Ordering::AcqRel);
             queue.push_back(Box::new(move || {
                 job();
-                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-                *n -= 1;
-                if *n == 0 {
-                    left.1.notify_all();
+                if left.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    let mut done = left.finished.lock().unwrap_or_else(|e| e.into_inner());
+                    *done = true;
+                    left.cv.notify_one();
                 }
             }));
         }
     }
-    workers.more.notify_all();
+    if count > wide_threads() {
+        workers.more.notify_all();
+    } else {
+        for _ in 0..count.saturating_sub(1) {
+            workers.more.notify_one();
+        }
+    }
     loop {
         let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
         match job {
@@ -1569,10 +1607,12 @@ fn wide(jobs: Vec<Job>) {
             None => break,
         }
     }
-    spin(|| left.0.try_lock().is_ok_and(|n| *n == 0));
-    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-    while *n > 0 {
-        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
+    spin(|| left.remaining.load(Ordering::Acquire) == 0);
+    if left.remaining.load(Ordering::Acquire) > 0 {
+        let mut done = left.finished.lock().unwrap_or_else(|e| e.into_inner());
+        while !*done {
+            done = left.cv.wait(done).unwrap_or_else(|e| e.into_inner());
+        }
     }
 }
 
@@ -5850,6 +5890,34 @@ mod window_tests {
             let (start, len) = window_of(address, end, g);
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
+        }
+    }
+
+    #[test]
+    fn wide_runs_all_jobs_and_completes() {
+        use super::{Arc, Job, Ordering, wide_each, wide_run};
+        for count in [0usize, 1, 2, 3, 16, 128] {
+            for _ in 0..8 {
+                let hits: Vec<std::sync::atomic::AtomicUsize> = (0..count).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect();
+                let hits = Arc::new(hits);
+                let jobs: Vec<Job> = (0..count)
+                    .map(|i| {
+                        let hits = hits.clone();
+                        Box::new(move || {
+                            hits[i].fetch_add(1, Ordering::Relaxed);
+                        }) as Job
+                    })
+                    .collect();
+                wide_run(jobs);
+                assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) == 1), "wide_run count={count}");
+
+                let each_hits = Arc::new((0..count).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect::<Vec<_>>());
+                let each_clone = each_hits.clone();
+                wide_each(count, move |i| {
+                    each_clone[i].fetch_add(1, Ordering::Relaxed);
+                });
+                assert!(each_hits.iter().all(|h| h.load(Ordering::Relaxed) == 1), "wide_each count={count}");
+            }
         }
     }
 }

@@ -60,7 +60,14 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
+    /// The full BLAKE3 of its container (the used-pipeline book keys by it).
+    #[allow(dead_code)]
+    pub(crate) full_hash: [u8; 32],
     container: Vec<u8>,
+    /// Whether it is one of the ray-tracing structure builder's compute
+    /// programs, computed once here ([`of_builder`]).
+    #[cfg(windows)]
+    is_builder: bool,
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
@@ -69,6 +76,10 @@ pub(crate) struct Shader {
     pub(crate) probe: Option<crate::lightprobe::Role>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// Its translation with the driver-crash fallback mnemonic disabled
+    /// ([`Shader::translated_disabled`]), apart from the normal translation.
+    #[cfg(windows)]
+    translated_fallback: OnceLock<Option<Translated>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -116,13 +127,18 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
+                full_hash: *full.as_bytes(),
                 container: bytes.to_vec(),
+                #[cfg(windows)]
+                is_builder: stage == "compute" && is_builder_container(bytes),
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
                 probe: crate::lightprobe::on().then(|| crate::lightprobe::role(bytes)).flatten(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                translated_fallback: OnceLock::new(),
             })
         })
         .clone()
@@ -191,6 +207,24 @@ impl Shader {
             })
             .as_ref()
     }
+
+    /// The translation made with `mnemonic` lowered as a no-op: the fallback
+    /// for a shader whose normal translation the host driver miscompiles.
+    /// Cached apart from [`translated`], so the normal translation is kept.
+    pub(crate) fn translated_disabled(&self, mnemonic: &str) -> Option<&Translated> {
+        self.translated_fallback
+            .get_or_init(|| translate_with(&self.container, &[mnemonic.to_owned()]).ok())
+            .as_ref()
+    }
+
+    /// The translation for this shader under `fallback` (`Some((hash,
+    /// mnemonic))` names this shader's culprit), else the normal translation.
+    pub(crate) fn translated_for(&self, fallback: Option<(&str, &str)>) -> Option<&Translated> {
+        match fallback {
+            Some((hash, mnemonic)) if hash == self.hash.as_str() => self.translated_disabled(mnemonic),
+            _ => self.translated(),
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -206,39 +240,24 @@ impl Shader {
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
+    translate_with(container, &[])
+}
+
+#[cfg(windows)]
+fn translate_with(container: &[u8], disabled: &[String]) -> Result<Translated, String> {
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
-    let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let programs = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
-        Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
-        None => Vec::new(),
-    };
-    let host = crate::shader_cache::host_shader(container)?;
-    let stores = programs.is_empty() || programs.iter().any(stores);
-    let threads = programs.iter().find_map(|p| match &p.io {
-        victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
-        _ => None,
-    });
-    let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
-    let used = programs
-        .into_iter()
-        .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-            )
-        })
-        .map(|p| p.used)
-        .unwrap_or_default();
-    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
+    // The cache gives the metadata with the shader: a VSH3 hit parses
+    // nothing (no container, no zlib, no decode).
+    let (host, meta) = crate::shader_cache::host_shader_with(container, disabled)?;
+    let tables = crate::draw::TablePlan::new(&meta.used, &host.root_indexed_views);
     Ok(Translated {
         host,
-        threads,
-        used,
+        threads: meta.threads,
+        used: meta.used,
         tables,
-        stores,
-        stores_by_address,
+        stores: meta.stores,
+        stores_by_address: meta.stores_by_address,
         picks: Default::default(),
     })
 }
@@ -285,20 +304,23 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
     rests: 0,
 });
 
-/// Whether `shaders` are a pipeline of the structure builder.
+/// Whether `bytes` is a compute container whose programs are the structure
+/// builder's (its programs have a spilled user-data table).
 #[cfg(windows)]
-fn of_builder(shaders: &[Arc<Shader>]) -> bool {
+fn is_builder_container(bytes: &[u8]) -> bool {
     use victory_shader::{Container, FourCC};
-    let [shader] = shaders else { return false };
-    if shader.stage != "compute" {
-        return false;
-    }
-    let Ok(c) = Container::parse(&shader.container) else {
+    let Ok(c) = Container::parse(bytes) else {
         return false;
     };
     c.part(FourCC::DXIL)
         .and_then(|part| victory_shader::native_programs(part.data).ok())
         .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
+}
+
+/// Whether `shaders` are a pipeline of the structure builder.
+#[cfg(windows)]
+fn of_builder(shaders: &[Arc<Shader>]) -> bool {
+    matches!(shaders, [s] if s.is_builder)
 }
 
 /// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store
@@ -368,52 +390,6 @@ pub(crate) fn builder_runs() -> bool {
     true
 }
 
-/// Whether a console program can store to buffer memory: it has a buffer,
-/// typed-buffer, scalar-memory, flat or global store or atomic, or code
-/// that is not all known (an instruction of those kinds outside our table,
-/// an indirect jump, code that does not decode). Stores to textures
-/// (image instructions) and to the program's own scratch memory do not
-/// count: neither reaches a buffer's host copy. After upstream #413,
-/// which leaves scalar-memory stores out and counts image stores.
-#[cfg(windows)]
-fn stores(program: &victory_shader::NativeProgram) -> bool {
-    use victory_shader::gfx10::{Encoding, decode};
-    let Ok(code) = decode(&program.code) else {
-        return true;
-    };
-    code.iter().any(|i| {
-        let name = i.name();
-        match i.encoding {
-            Encoding::Mubuf
-            | Encoding::Mtbuf
-            | Encoding::Smem
-            | Encoding::Flat
-            | Encoding::Global => name.is_none_or(|n| {
-                (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
-            }),
-            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
-            _ => false,
-        }
-    })
-}
-
-/// Whether a console program can store to memory through raw addresses
-/// (`crate::memory`): a flat or global store or atomic, or code that does
-/// not decode. The programs that only walk ray-tracing structures do not,
-/// whatever they store through views.
-#[cfg(windows)]
-fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
-    use victory_shader::gfx10::{Encoding, decode};
-    let Ok(code) = decode(&program.code) else {
-        return true;
-    };
-    code.iter().any(|i| {
-        matches!(i.encoding, Encoding::Flat | Encoding::Global)
-            && i.name()
-                .is_none_or(|n| (n.contains("store") || n.contains("atomic")) && !n.contains("scratch"))
-    })
-}
-
 #[repr(C)]
 struct Pipeline {
     object: Object,
@@ -467,10 +443,48 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// Starts the host pipeline of `this` without waiting for it: a pipeline bound
+/// is likely drawn soon, so its compile starts at bind, not at the draw that
+/// needs it.
+#[cfg(windows)]
+pub(crate) fn prefetch(this: This) {
+    if this.is_null() {
+        return;
+    }
+    make::prefetch(&pipeline(this).host);
+}
+
+/// Runs `f` with `frame` as the recording frame of this thread (thin mode's
+/// `Recording::run`), so waits are charged to the recording's frame.
+#[cfg(windows)]
+pub(crate) fn with_recording_frame(frame: u64, f: impl FnOnce()) {
+    make::with_recording_frame(frame, f);
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
     make::waiting()
+}
+
+/// Progress of the current pipeline warming batch: `(done, total, waiting)`.
+#[cfg(windows)]
+pub(crate) fn warming_progress() -> (u64, u64, u64) {
+    make::progress()
+}
+
+/// Updates whether pipeline workers should boost during menus and loading screens.
+#[cfg(windows)]
+pub(crate) fn set_loading_boost(loading: bool) {
+    make::set_loading_boost(loading);
+}
+
+/// Host pipelines created and loaded from the library since the start.
+#[cfg(windows)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn library_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (library::MADE.load(Relaxed), library::LOADED.load(Relaxed))
 }
 
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
@@ -575,15 +589,16 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let (host, is_new) = make::Pending::get_or_create(shaders.clone(), graphics);
     #[cfg(windows)]
-    known::note(host.key(), &shaders, host.graphics.as_deref());
-    #[cfg(windows)]
-    make::early(&host);
+    if is_new {
+        known::note(host.key(), &shaders, host.graphics.as_deref());
+        make::early(&host);
+    }
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
-    if builder {
+    if builder && is_new {
         // Another stage: the group is looked at again at its next dispatch.
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
         b.pipelines.push(host.clone());
@@ -771,6 +786,8 @@ pub mod known;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+mod canary;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.
@@ -798,6 +815,12 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
 pub fn save_pipeline_cache() {
     library::save(true);
     known::flush();
+}
+
+/// The `victory canary-worker` child's loop (see `canary::run_worker`).
+#[cfg(windows)]
+pub fn canary_worker() {
+    canary::run_worker();
 }
 
 #[cfg(test)]

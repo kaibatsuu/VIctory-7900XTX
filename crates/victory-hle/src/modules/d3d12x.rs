@@ -80,6 +80,18 @@ pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
     }
 }
 
+/// Hex-encoded fingerprint of the active shader translation settings.
+pub fn shader_cache_fingerprint() -> String {
+    #[cfg(windows)]
+    {
+        victory_gpu::shader_cache::translation_hex()
+    }
+    #[cfg(not(windows))]
+    {
+        String::new()
+    }
+}
+
 /// Keeps the host's translations of the title's shaders in `dir` (a
 /// folder of the cache) across runs, and its compiled pipelines beside it
 /// (`pipelines`).

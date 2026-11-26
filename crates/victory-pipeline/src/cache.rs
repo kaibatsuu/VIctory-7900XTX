@@ -21,6 +21,19 @@ impl CacheKey {
         CacheKey(h.finalize())
     }
 
+    /// As [`new`], over `parts` hashed in order (their concatenation, without
+    /// copying them together).
+    pub fn new_parts(converter: &dyn Converter, parts: &[&[u8]]) -> Self {
+        let mut h = blake3::Hasher::new();
+        h.update(converter.id().as_bytes());
+        h.update(&[0]);
+        h.update(&converter.version().to_le_bytes());
+        for part in parts {
+            h.update(part);
+        }
+        CacheKey(h.finalize())
+    }
+
     pub fn to_hex(&self) -> String {
         self.0.to_hex().to_string()
     }
@@ -69,6 +82,38 @@ impl Cache {
         }
         published?;
         Ok(path)
+    }
+
+    /// Returns the cached output's path and bytes for the concatenation of
+    /// `parts`, converting it first if needed. The parts are hashed in order
+    /// and the file is read once, without copying them together first.
+    pub fn read_or_convert_parts(&self, converter: &dyn Converter, parts: &[&[u8]]) -> Result<(PathBuf, Vec<u8>)> {
+        let key = CacheKey::new_parts(converter, parts);
+        let path = self.path_for(&key);
+        // One open (a miss is `NotFound`) rather than `is_file()` and a read.
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit");
+                return Ok((path, bytes));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        let input: Vec<u8> = parts.concat();
+        let output = converter
+            .convert(&input)
+            .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
+        let dir = path.parent().expect("hashed path has a parent");
+        std::fs::create_dir_all(dir)?;
+        let (tmp, mut file) = tempfile_in(dir)?;
+        let written = file.write_all(&output);
+        drop(file);
+        let published = written.and_then(|()| std::fs::rename(&tmp, &path));
+        if published.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        published?;
+        Ok((path, output))
     }
 }
 

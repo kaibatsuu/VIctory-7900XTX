@@ -161,7 +161,7 @@ fn submit_cut(this: This, lists: &[This]) {
         // Sent to the card and not waited for: their host sides are taken
         // from the title's lists (which it may reset before they have run)
         // and come back, with their tables' slots, when they are settled.
-        let (taken, order) = crate::list::detach(&lists[..first]);
+        let (taken, order) = crate::list::detach(&lists[..first], false);
         host.execute_late(taken, order);
     } else if first > 0 {
         let now: Vec<_> = lists[..first]
@@ -177,7 +177,7 @@ fn submit_cut(this: This, lists: &[This]) {
         crate::list::tables_done(&lists[..first]);
     }
     if first < lists.len() {
-        let parts = crate::list::detach_parts(&lists[first..]);
+        let parts = crate::list::detach_parts(&lists[first..], false);
         static SEEN: AtomicU64 = AtomicU64::new(0);
         if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
             tracing::info!(
@@ -273,7 +273,7 @@ fn submit_split(this: This, lists: &[This]) {
             };
             let waits: Vec<crate::list::ValueWait> = by[from..to].concat();
             pieces.extend(waits.into_iter().map(Held::Value));
-            let (taken, order) = crate::list::detach(&lists[from..to]);
+            let (taken, order) = crate::list::detach(&lists[from..to], false);
             pieces.push(Held::Run(taken, order));
             from = to;
         }
@@ -605,7 +605,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             }
         }
         let kept = hold(this, || {
-            let (taken, order) = crate::list::detach(lists);
+            let (taken, order) = crate::list::detach(lists, false);
             Held::Run(taken, order)
         });
         // Diagnostics: the order submissions are made in, next to the

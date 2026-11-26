@@ -6,8 +6,14 @@
 //! memory categories already counted here into one approximation.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+static XMEM_STATS: OnceLock<fn() -> String> = OnceLock::new();
+
+pub(crate) fn set_xmem_stats(f: fn() -> String) {
+    let _ = XMEM_STATS.set(f);
+}
 
 /// Counters since the last line.
 pub(crate) enum C {
@@ -763,6 +769,13 @@ fn log_memory_map() {
         started.elapsed().as_millis(),
         text.join("; ")
     );
+    let (sections, bytes) = crate::inplace::whole_views_bytes();
+    if sections > 0 {
+        tracing::info!("inplace::beside whole-section views: {sections} sections, {} MB VA", bytes >> 20);
+    }
+    if let Some(f) = XMEM_STATS.get() {
+        tracing::info!("{}", f());
+    }
     // The private allocations the kinds above leave as "other" (and the
     // write-combined ones), grouped by their size: the sizes name their
     // owners (the pipeline library's file to the byte, a snapshot buffer

@@ -474,6 +474,15 @@ enum Ask {
     Lists(Recordings),
 }
 
+/// The fence signals a submission was given behind: set once it has run.
+fn do_signals(signals: Vec<(usize, u64)>) {
+    for (fence, value) in signals {
+        if !crate::host::late_signal(fence, value) {
+            crate::fence::set(fence as This, value);
+        }
+    }
+}
+
 impl Work for Job {
     type Ask = Ask;
 
@@ -494,8 +503,31 @@ impl Work for Job {
         let Job::Lists(queue, recordings) = self else {
             return vec![self];
         };
-        let lists: Vec<This> = recordings.iter().map(|r| r.back()).collect();
-        let jobs = jobs_of(queue as This, &lists);
+        // With `VICTORY_LIST_RELEASE`, each recording's list is taken for this
+        // submission: it is given back once the card has run it, and a
+        // recording named again (its list submitted closed again) gets a
+        // fresh list. Named twice here it runs its list twice, as before.
+        let release = crate::list::thin::release();
+        let lists: Vec<This> = if release {
+            let mut seen: Vec<(usize, This)> = Vec::new();
+            recordings
+                .iter()
+                .map(|r| {
+                    let at = std::sync::Arc::as_ptr(r) as usize;
+                    match seen.iter().find(|(p, _)| *p == at) {
+                        Some(&(_, back)) => back,
+                        None => {
+                            let back = r.take_back();
+                            seen.push((at, back));
+                            back
+                        }
+                    }
+                })
+                .collect()
+        } else {
+            recordings.iter().map(|r| r.back()).collect()
+        };
+        let jobs = jobs_of(queue as This, &lists, release);
         // It stood for one submission not begun.
         let runs = jobs.iter().filter(|j| j.runs()).count() as u64;
         QUEUED.fetch_add(runs, Relaxed);
@@ -633,9 +665,20 @@ impl Work for Job {
                 let _ = queue;
                 #[cfg(feature = "diagnostics")]
                 crate::capture::op(queue, || format!("RUN submission of {} lists (its thread's)", order.len()));
-                match crate::host::host() {
-                    Some(host) => host.execute_late(lists, order),
-                    None => drop(lists),
+                if split() {
+                    match crate::host::host() {
+                        Some(host) => {
+                            if let Some(prepared) = host.prepare_late(lists, order, &[]) {
+                                SETTLED.push(Handoff { prepared, signals: Vec::new() });
+                            }
+                        }
+                        None => drop(lists),
+                    }
+                } else {
+                    match crate::host::host() {
+                        Some(host) => host.execute_late(lists, order),
+                        None => drop(lists),
+                    }
                 }
                 QUEUED.fetch_sub(1, Relaxed);
             }
@@ -645,17 +688,29 @@ impl Work for Job {
                 crate::capture::op(queue, || {
                     format!("RUN {} parts of submissions in one, {} lists (its thread's)", 1 + parts.len(), order.len())
                 });
-                match crate::host::host() {
-                    Some(host) => host.execute_parts(lists, order, &parts),
-                    None => drop(lists),
+                if split() {
+                    match crate::host::host() {
+                        Some(host) => match host.prepare_late(lists, order, &parts) {
+                            // Sent ahead; the signals go once it is settled.
+                            Some(prepared) => SETTLED.push(Handoff { prepared, signals }),
+                            // Sent and settled on this thread (a cut): the
+                            // signals go now, as before.
+                            None => do_signals(signals),
+                        },
+                        None => {
+                            drop(lists);
+                            do_signals(signals);
+                        }
+                    }
+                } else {
+                    match crate::host::host() {
+                        Some(host) => host.execute_parts(lists, order, &parts),
+                        None => drop(lists),
+                    }
+                    do_signals(signals);
                 }
                 // (A part that had no list is one all the same.)
                 QUEUED.fetch_sub(1 + parts.len() as u64, Relaxed);
-                for (fence, value) in signals {
-                    if !crate::host::late_signal(fence, value) {
-                        crate::fence::set(fence as This, value);
-                    }
-                }
             }
             Job::Signal(fence, value) => {
                 if !crate::host::late_signal(fence, value) {
@@ -707,6 +762,58 @@ const FORCED: usize = 9;
 /// Parts prepared together with the one before them.
 const JOINED: usize = 10;
 
+/// A submission the thread that prepares has sent, for the thread that
+/// settles ([`split`]): what is to be waited for, and the signals given
+/// behind it.
+struct Handoff {
+    prepared: crate::host::Prepared,
+    signals: Vec<(usize, u64)>,
+}
+
+/// The line of sent submissions the thread that settles takes from, in the
+/// order the thread that prepares sent them ([`split`]).
+struct Settled {
+    items: Mutex<VecDeque<Handoff>>,
+    /// How many were put in it, and how many were settled.
+    pushed: AtomicU64,
+    settled: AtomicU64,
+    moved: Condvar,
+}
+
+static SETTLED: Settled = Settled::new();
+
+impl Settled {
+    const fn new() -> Self {
+        Settled { items: Mutex::new(VecDeque::new()), pushed: AtomicU64::new(0), settled: AtomicU64::new(0), moved: Condvar::new() }
+    }
+
+    fn push(&self, what: Handoff) {
+        self.pushed.fetch_add(1, Relaxed);
+        self.items.lock().unwrap_or_else(|e| e.into_inner()).push_back(what);
+        // Both who takes one ([`Self::pop`]) and who waits for all ([`Self::drain`])
+        // may be here; wake them all.
+        self.moved.notify_all();
+    }
+
+    fn pop(&self) -> Handoff {
+        let mut state = self.items.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(what) = state.pop_front() {
+                return what;
+            }
+            state = self.moved.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Until everything pushed so far is settled ([`drain`]).
+    fn drain(&self) {
+        let mut state = self.items.lock().unwrap_or_else(|e| e.into_inner());
+        while self.settled.load(Relaxed) != self.pushed.load(Relaxed) {
+            state = self.moved.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
 /// How many submissions may be in the line when a submit call returns
 /// (`VICTORY_SUBMIT_DEPTH`; 64: about two frames of the title's).
 fn runs_most() -> usize {
@@ -724,6 +831,23 @@ fn frames_most() -> usize {
 
 fn number(name: &str) -> Option<usize> {
     std::env::var(name).ok()?.trim().parse().ok()
+}
+
+/// Whether the one thread that prepares and sends submissions is two in a
+/// row (`VICTORY_SUBMIT_SPLIT=1`; with `VICTORY_ASYNC_SUBMIT`): one prepares
+/// and sends each submission, the other waits for what was sent and settles
+/// it. Off (the default): the one thread does both, as before. Set by
+/// [`started`] once the thread that settles is up.
+static SPLIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn split() -> bool {
+    SPLIT.load(Relaxed)
+}
+
+/// Whether the split was asked for (`VICTORY_SUBMIT_SPLIT=1`).
+fn wants_split() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SUBMIT_SPLIT").is_some_and(|v| v == "1"))
 }
 
 thread_local! {
@@ -762,12 +886,16 @@ fn started() -> bool {
             tracing::warn!("VICTORY_ASYNC_SUBMIT=1 needs the relay and lists cut at their waits: submissions are prepared by the thread that makes them");
             return false;
         }
-        let worker = || {
+        // Both of our threads: on the fast cores, and known to [`drain`].
+        let ours = |name: &'static str| {
             use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
             // SAFETY: this thread's own priority.
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
-            crate::cores::keep_on_fast_cores("victory-submit");
+            crate::cores::keep_on_fast_cores(name);
             OURS.set(true);
+        };
+        let prepare = move || {
+            ours("victory-submit");
             let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| LANE.serve()));
             if ended.is_err() {
                 // Nothing would ever be sent again, and the title's thread
@@ -775,11 +903,41 @@ fn started() -> bool {
                 crate::host::fail(format_args!("the thread that prepares and sends submissions panicked"));
             }
         };
-        match std::thread::Builder::new().name("victory-submit".into()).spawn(worker) {
+        let settle = move || {
+            ours("victory-submit-send");
+            let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
+                let Handoff { prepared, signals } = SETTLED.pop();
+                if let Some(host) = crate::host::host() {
+                    host.send_prepared(prepared);
+                }
+                do_signals(signals);
+                SETTLED.settled.fetch_add(1, Relaxed);
+                SETTLED.moved.notify_all();
+            }));
+            if ended.is_err() {
+                // Nothing would ever be settled again, and the title's
+                // thread would stand at its next drain for good.
+                crate::host::fail(format_args!("the thread that settles submissions sent ahead panicked"));
+            }
+        };
+        // The thread that settles first: the split is on only once it is, so
+        // the thread that prepares hands to it and never stands at an empty
+        // line for good.
+        if wants_split() {
+            match std::thread::Builder::new().name("victory-submit-send".into()).spawn(settle) {
+                Ok(_) => SPLIT.store(true, Relaxed),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no thread to settle submissions sent ahead: the thread that prepares settles them (VICTORY_SUBMIT_SPLIT=1 off)");
+                    SPLIT.store(false, Relaxed);
+                }
+            }
+        }
+        match std::thread::Builder::new().name("victory-submit".into()).spawn(prepare) {
             Ok(_) => {
                 tracing::info!(
                     frames = frames_most(),
                     runs = runs_most(),
+                    split = split(),
                     "submissions are prepared and sent by a thread of ours, not by the thread that submits (VICTORY_ASYNC_SUBMIT=1)"
                 );
                 true
@@ -817,6 +975,12 @@ pub(super) fn drain() {
     }
     let began = Instant::now();
     LANE.drain();
+    if split() {
+        // The preparing thread has sent them; the settling thread has to be
+        // done with them too, or a read-back would not see what was copied
+        // back.
+        SETTLED.drain();
+    }
     STATS[DRAINING].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     STATS[DRAINS].fetch_add(1, Relaxed);
 }
@@ -836,7 +1000,7 @@ pub(super) fn submit(this: This, lists: &[This]) {
         room(before + 1);
         return;
     }
-    let jobs = jobs_of(this, lists);
+    let jobs = jobs_of(this, lists, false);
     let runs = jobs.iter().filter(|j| j.runs()).count() as u64;
     let before = QUEUED.fetch_add(runs, Relaxed);
     STATS[RUNS].fetch_add(runs, Relaxed);
@@ -856,8 +1020,10 @@ fn room(queued: u64) {
     }
 }
 
-/// What a submission of `lists` is in the line.
-fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
+/// What a submission of `lists` is in the line. `release`: the lists are a
+/// thin recording's, whose list of ours is given back once it has run
+/// ([`crate::list::thin`], `VICTORY_LIST_RELEASE=1`).
+fn jobs_of(this: This, lists: &[This], release: bool) -> Vec<Job> {
     let queue = this as usize;
     // In one piece up to the first list that waits for a memory value, as
     // `super::submit_cut` runs them; the rest part by part.
@@ -878,11 +1044,11 @@ fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
     });
     let mut jobs: Vec<Job> = Vec::new();
     if first > 0 {
-        let (taken, order) = crate::list::detach(&lists[..first]);
+        let (taken, order) = crate::list::detach(&lists[..first], release);
         jobs.push(Job::Run(queue, taken, order));
     }
     if first < lists.len() {
-        for (waits, taken, order) in crate::list::detach_parts(&lists[first..]) {
+        for (waits, taken, order) in crate::list::detach_parts(&lists[first..], release) {
             jobs.extend(waits.into_iter().map(Job::Value));
             jobs.push(Job::Run(queue, taken, order));
         }
