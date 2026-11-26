@@ -30,6 +30,18 @@ pub(super) mod intersect;
 #[path = "float64.rs"]
 mod float64;
 
+/// `VICTORY_D16_BITS` (default 1; `=0` as before): d16 loads and gathers through
+/// views of integer formats keep their 16 bits where no view-kind word says
+/// ([`Lower::d16_bits`]).
+fn d16_bits_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
+}
+
+fn d16_bits_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| d16_bits_enabled(std::env::var_os("VICTORY_D16_BITS").as_deref()))
+}
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -7772,6 +7784,31 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, is_zero, zero, bits)
     }
 
+    /// (`VICTORY_D16_BITS`) A d16 load's 16 bits from `x`, the 32-bit value a
+    /// float-typed load returned, where no view-kind word tells the view's
+    /// format (images, descriptors chosen by control flow). Through a view of
+    /// an integer format the host passes the integer's bits unconverted: a
+    /// 16-bit unsigned (or non-negative signed) value is a tiny denormal there
+    /// (bits up to `0xFFFF`), a negative signed one sign-extended (bits from
+    /// `0xFFFF8000`), and the console's d16 load gives its low 16 bits;
+    /// converting them as a float gave 0 (or NaN). Every other value is
+    /// converted to a half as before.
+    fn d16_bits(&mut self, x: V) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let half = self.s.op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x]);
+        if !d16_bits_on() {
+            return half;
+        }
+        let bits = self.as_int(x);
+        let (top, neg) = (self.s.m.i32(0xFFFF), self.s.m.i32(0xFFFF_7FFF));
+        let small = self.s.m.cmp(c, pred::IULE, bits, top);
+        let negative = self.s.m.cmp(c, pred::IUGT, bits, neg);
+        let integer = self.s.m.bin(c, Bin::Or, small, negative);
+        let low = self.s.m.bin(c, Bin::And, bits, top);
+        self.s.m.select(c, integer, low, half)
+    }
+
     /// Channels of buffer format `format`, as [`Self::format_load`] gives
     /// them, as d16 data: 16 bits each, two per dword, low half first (an
     /// odd last high half 0). Integer formats keep their low 16 bits; the
@@ -12060,11 +12097,16 @@ impl<'a> Lower<'a> {
                 None => self.s.m.extract(c, r, ch),
             };
             xs.push(if *d16 {
-                // shortcut: d16 results are taken as floats (rounded to
-                // nearest even); integer formats would keep 16 bits.
-                let i32t = self.s.t.i32;
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x])
+                // d16 results are taken as floats (rounded to nearest even); a load
+                // or gather through an integer view keeps its 16 bits ([`Self::d16_bits`]).
+                // shortcut: samples are always floats.
+                if matches!(op, 66 | 73) {
+                    self.d16_bits(x)
+                } else {
+                    let i32t = self.s.t.i32;
+                    self.s
+                        .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x])
+                }
             } else {
                 self.as_int(x)
             });
@@ -12639,9 +12681,14 @@ impl<'a> Lower<'a> {
                 let mut x = None;
                 for ch in (2 * k..(2 * k + 2).min(count)).rev() {
                     let f = self.s.m.extract(c, r, ch);
-                    let mut h = self
-                        .s
-                        .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+                    let mut h = if typed && integer.is_none() {
+                        // No view-kind word for this view: keep its 16 bits where
+                        // they are an integer's ([`Self::d16_bits`]).
+                        self.d16_bits(f)
+                    } else {
+                        self.s
+                            .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                    };
                     if let Some((int, _)) = integer {
                         let bits = self.as_int(f);
                         let low = self.s.m.i32(0xFFFF);
@@ -14013,5 +14060,25 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn d16_bits_switch_and_integer_range() {
+        use std::ffi::OsStr;
+        assert!(super::d16_bits_enabled(None));
+        assert!(super::d16_bits_enabled(Some(OsStr::new("1"))));
+        assert!(!super::d16_bits_enabled(Some(OsStr::new("0"))));
+        // Unsigned 16-bit (0..=0xFFFF) and sign-extended negative i16 (0xFFFF8000..=0xFFFFFFFF)
+        // match the integer range; normal f32 values do not.
+        let is_int = |bits: u32| bits <= 0xFFFF || bits > 0xFFFF_7FFF;
+        assert!(is_int(0));
+        assert!(is_int(1));
+        assert!(is_int(0xFFFF));
+        assert!(is_int((-1i16) as i32 as u32));
+        assert!(is_int(i16::MIN as i32 as u32));
+        assert!(!is_int(1.0f32.to_bits()));
+        assert!(!is_int((-1.0f32).to_bits()));
+        assert!(!is_int(0.5f32.to_bits()));
+        assert!(!is_int(65504.0f32.to_bits()));
     }
 }
