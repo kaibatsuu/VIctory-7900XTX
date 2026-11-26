@@ -33,6 +33,15 @@
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
 //! bounds what the air scatters by a multiple of the light around.
+//!
+//! `VICTORY_AMBIENT_LEFTOVER` (from codec-d/cool_fox 30e54b4, Neptune-VE):
+//! what to do with the light the title's own resolve left in place.
+//! `keep` (the default, the code's default as before): the larger of it and
+//! the estimate per channel, with its brightness bounded: its hue stays, and
+//! without rays the leftover is whatever the probes' memory held (Neptune-VE
+//! saw bright magenta on translucent surfaces). `hue`: its brightness within
+//! the same bound in the estimate's colour. `off`: the estimate alone (their
+//! default; with it a sheet of paper that glowed magenta was white).
 
 use std::sync::{Mutex, OnceLock};
 
@@ -110,6 +119,23 @@ fn air() -> f32 {
         let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
         set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
     })
+}
+
+/// What `raise` does with the light the title's own resolve left
+/// (`VICTORY_AMBIENT_LEFTOVER`): `keep` (0, the default, as before), `hue`
+/// (1), or `off` (2) for the estimate alone. See the module's note.
+fn leftover() -> u32 {
+    static SET: OnceLock<u32> = OnceLock::new();
+    *SET.get_or_init(|| leftover_mode(&std::env::var("VICTORY_AMBIENT_LEFTOVER").unwrap_or_default()))
+}
+
+/// [`leftover`] for a value of the switch.
+fn leftover_mode(set: &str) -> u32 {
+    match set.trim() {
+        s if s.eq_ignore_ascii_case("hue") => 1,
+        s if s.eq_ignore_ascii_case("off") => 2,
+        _ => 0,
+    }
 }
 
 /// How the slow mean of the light around follows the frames
@@ -199,7 +225,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=15, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
+#define RS "RootConstants(num32BitConstants=16, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -209,7 +235,7 @@ cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; uint probe;
-    float jump; float fresh; float dt;
+    float jump; float fresh; float dt; uint leftover;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -412,8 +438,18 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float bound = fresh > 0.0 ? lerp(1.0, most, saturate(cells[CELLS].a / fresh)) : most;
     float top = max(dot(found, LUMA) * bound, 1e-6);
     float has = dot(was, LUMA);
-    was *= min(1.0, top / max(has, 1e-6));
-    float3 written = max(was, found);
+    float3 written;
+    if (leftover == 2) {
+        // The estimate alone: the memory's colour is no light.
+        written = found;
+    } else if (leftover == 1) {
+        // Its brightness counts, within the same bound, in the estimate's
+        // colour.
+        written = found * max(1.0, min(left, top) / max(dot(found, LUMA), 1e-6));
+    } else {
+        was *= min(1.0, top / max(has, 1e-6));
+        written = max(was, found);
+    }
     light[p] = pack(written);
     if (probe != 0 && (at.x & 15) == 0 && (at.y & 15) == 0) {
         uint ignored;
@@ -561,7 +597,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.stats);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 15];
+    let mut words = [0u32; 16];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -574,6 +610,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
     words[14] = (frame_ms(role) / 1000.0).to_bits();
+    words[15] = leftover();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -581,7 +618,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -623,6 +660,13 @@ mod tests {
         assert_eq!(parse("0.8"), Set::Estimate(0.8));
         assert_eq!(parse("constant:0.3"), Set::Constant(0.3));
         assert_eq!(parse("constant:nan"), Set::Off);
+        // The leftover (codec-d/cool_fox 30e54b4): kept unless asked
+        // otherwise, as before this switch existed; the shader reads 0, 1, 2.
+        assert_eq!(leftover_mode(""), 0);
+        assert_eq!(leftover_mode("keep"), 0);
+        assert_eq!(leftover_mode(" Hue "), 1);
+        assert_eq!(leftover_mode("off"), 2);
+        assert_eq!(leftover_mode("whatever"), 0);
     }
 
     #[test]
