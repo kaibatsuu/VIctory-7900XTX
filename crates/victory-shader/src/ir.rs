@@ -131,6 +131,14 @@ impl Inst {
 /// ([`ShaderError::Unsupported`]).
 pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderError> {
     let mut list = gfx10::decode(code)?;
+    // `VICTORY_TRUNCATE=<N>`: translate only the first N native instructions.
+    // A bisect tool for finding which instruction of a shader makes the host
+    // driver crash on the emitted DXIL (see the translate --pipelines repro).
+    if let Ok(v) = std::env::var("VICTORY_TRUNCATE")
+        && let Ok(n) = v.trim().parse::<usize>()
+    {
+        list.truncate(n);
+    }
     let lanes = 1 + u8::from(wave64);
     let isa = |offset, reason| ShaderError::Isa { offset, reason };
 
