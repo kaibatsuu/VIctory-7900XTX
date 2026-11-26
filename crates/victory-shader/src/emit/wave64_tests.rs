@@ -738,3 +738,111 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
         }
     }
 }
+
+/// One console wave of 64 threads summing doubles over the lanes below s0 as the title's
+/// water volumetrics count their lanes (`water_shading:CS_TransmissionVolumetrics`,
+/// 0x5c4-0x68c): `v_add_f64` of each dword pair moved by DPP, `v_permlanex16` and lane 32,
+/// the sum moved to s[20:21] and taken back as a float (`v_cvt_f32_f64`). The terms here are
+/// the thread index as a double (`v_cvt_f64_f32`), so the sum is s0 (s0 - 1) / 2.
+/// (Op-lite/victory-scarlett 411a745.)
+fn doubles_sum_program() -> NativeProgram {
+    let mut words = vec![
+        0x7E3E_0D00, // v_cvt_f32_u32 v31, v0
+        0x7E3A_211F, // v_cvt_f64_f32 v[29:30], v31
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_046A, // s_mov_b64 s[12:13], vcc
+        0xBE90_25C1, // s_or_saveexec_b64 s[16:17], -1
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0x8792_100C, // s_and_b64 s[18:19], s[12:13], s[16:17]
+        0xD501_0002,
+        0x004A_3B02, // v_cndmask_b32 v2, v2, v29, s[18:19]
+        0xD501_0003,
+        0x004A_3D03, // v_cndmask_b32 v3, v3, v30, s[18:19]
+    ];
+    // v_mov_b32 v4, v2 / v5, v3 with each DPP pattern, then v_add_f64 v[2:3], v[4:5], v[2:3]
+    for (code, dpp) in [(0xE9, 0xDE54_C100), (0xE9, 0x9360_1200), (0xE9, 0x0009_2400), (0xFA, 0xFF09_4000)] {
+        words.extend([0x7E08_0200 | code, dpp | 2, 0x7E0A_0200 | code, dpp | 3, 0xD564_0002, 0x0002_0504]);
+    }
+    words.extend([
+        0xD778_0004,
+        0x0201_0102, // v_permlanex16_b32 v4, v2, 0, 0
+        0xD778_0005,
+        0x0201_0103, // v_permlanex16_b32 v5, v3, 0, 0
+        0xD564_0002,
+        0x0002_0504, // v_add_f64 v[2:3], v[4:5], v[2:3]
+        0xD760_0012,
+        0x0001_4102, // v_readlane_b32 s18, v2, 32
+        0xD760_0013,
+        0x0001_4103, // v_readlane_b32 s19, v3, 32
+        0xD564_0002,
+        0x0002_0412, // v_add_f64 v[2:3], s[18:19], v[2:3]
+        0xD760_0012,
+        0x0001_0102, // v_readlane_b32 s18, v2, 0
+        0xD760_0013,
+        0x0001_0103, // v_readlane_b32 s19, v3, 0
+        0xBE94_0312, // s_mov_b32 s20, s18
+        0xBE95_0313, // s_mov_b32 s21, s19
+        0xBEFE_0410, // s_mov_b64 exec, s[16:17]
+        0x7E00_1E14, // v_cvt_f32_f64 v0, s[20:21]
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ]);
+    native(&words)
+}
+
+/// [`doubles_sum_program`]'s section leaves the sum's two dwords in s20 and s21 (both
+/// [`super::wave::Shape::Sum64`]).
+fn doubles_sum_sections(p: &ir::Program) -> usize {
+    let block = (0..p.blocks.len()).find(|&b| !super::wave::sections(p, b).is_empty()).expect("a section");
+    super::wave::sections(p, block)
+        .into_values()
+        .flat_map(|s| s.shapes.into_values())
+        .filter(|s| matches!(s, super::wave::Shape::Sum64 { .. }))
+        .count()
+}
+
+/// [`doubles_sum_program`] on a host of 32-lane waves: the two host waves' sums added.
+#[test]
+fn a_wave_sum_of_doubles_is_the_consoles() {
+    let native = doubles_sum_program();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let sums = doubles_sum_sections(&p);
+    assert!(sums >= 2, "{sums} dwords of 64-bit sums");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let bytes = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&bytes).expect("container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let shader = super::emit(&c, &native, &p, &st, &io, &res);
+    lower::TEST_HOST_WAVE.set(was);
+    let shader = shader.expect("emit");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for s0 in [64u32, 40, 33, 1, 0] {
+        let Some(got) = on_the_card(&shader, [s0, 0]) else { return };
+        let want = (s0 * s0.saturating_sub(1) / 2) as f32;
+        assert_eq!(f32::from_bits(got), want, "the lanes below {s0}");
+    }
+    eprintln!("ran on the hardware device: the sums of doubles over the console's 64 lanes");
+}
+
+/// [`doubles_sum_program`] on a host of 64-lane waves (the console's own wave, `WaveSize(64)`):
+/// one host wave operation on doubles.
+#[test]
+fn a_wave_sum_of_doubles_on_a_wave_of_64() {
+    let native = doubles_sum_program();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    assert!(doubles_sum_sections(&p) >= 2);
+    let shader = on_64_lanes(&native, &p);
+    for s0 in [64u32, 40, 33, 1, 0] {
+        let Some(got) = dispatched(&shader, &[s0, 0]) else { return };
+        let want = (s0 * s0.saturating_sub(1) / 2) as f32;
+        assert_eq!(f32::from_bits(got), want, "the lanes below {s0}");
+    }
+    eprintln!("ran on the hardware device: the sums of doubles over a wave of 64");
+}

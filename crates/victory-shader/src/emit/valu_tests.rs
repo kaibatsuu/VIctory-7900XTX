@@ -556,6 +556,64 @@ fn v_cvt_f32_f64_rounds_to_nearest_even() {
     });
 }
 
+/// 64-bit floats, which the title's water volumetrics count their lanes in: `v_add_f64` and
+/// `v_mul_f64` of register pairs (one operand negated, one an inline double),
+/// `v_cvt_f64_f32`, and `v_cvt_f32_f64` rounding to nearest (1 + 0.75 of a float's last
+/// place becomes 1 + one place). The doubles come in s0..s3 (v1..v4): a in v[1:2], b in
+/// v[3:4]. (Op-lite/victory-scarlett 411a745.)
+#[test]
+fn f64_arithmetic_and_conversions_are_ieee() {
+    let to_f32 = vop1(0x0F, 0, vgpr(5)); // v_cvt_f32_f64 v0, v[5:6]
+    let d = |a: f64, b: f64| {
+        let (a, b) = (a.to_bits(), b.to_bits());
+        [a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32]
+    };
+    let with = |first: &[u32]| {
+        let mut w = first.to_vec();
+        w.push(to_f32);
+        w
+    };
+    let add = with(&vop3(0x164, 5, vgpr(1), vgpr(3), 0)); // v_add_f64 v[5:6], v[1:2], v[3:4]
+    let neg_mul = with(&vop3_mod(0x165, 5, vgpr(1), vgpr(3), 0, 0, 1, 0, false)); // -a * b
+    let half = with(&vop3(0x164, 5, 240, vgpr(1), 0)); // v_add_f64 v[5:6], 0.5, v[1:2]
+    let mut wide = vec![vop1(0x10, 5, vgpr(1))]; // v_cvt_f64_f32 v[5:6], v1
+    wide.extend(vop3(0x164, 5, vgpr(5), vgpr(5), 0)); // v_add_f64 v[5:6], v[5:6], v[5:6]
+    wide.push(to_f32);
+    let near = 1.0 + 3.0 * 2f64.powi(-25);
+    let cases: [(&[u32], [u32; 4], f32); 6] = [
+        (&add, d(1.5, 2.25), 3.75),
+        (&add, d(near, 0.0), f32::from_bits(0x3F80_0001)),
+        (&add, d(1e300, -1e300), 0.0),
+        (&neg_mul, d(3.0, 0.5), -1.5),
+        (&half, d(2.0, 0.0), 2.5),
+        (&wide, [1.25f32.to_bits(), 0, 0, 0], 2.5),
+    ];
+    for (body, inputs, want) in cases {
+        let shader = build_valu_cs(body);
+        run_cases(&shader, &[inputs], |backend, _, _, got| {
+            assert_eq!(f32::from_bits(got), want, "{backend}: {body:08x?} on {inputs:08x?}");
+        });
+    }
+}
+
+/// The inline constant 1 / (2 pi) of a 64-bit float operand is the double the hardware
+/// holds, 0x3FC45F306DC9C882 (one below the nearest double to 1 / (2 pi), 0x...883):
+/// `v_add_f64 v[5:6], 1/(2pi), v[1:2]` with v[1:2] = 0 gives back its dwords exactly
+/// (`v_mov_b32 v0, v6` after it: the high dword; `v5`: the low one).
+#[test]
+fn the_inline_double_one_over_two_pi_is_the_hardwares() {
+    let hw = 0x3FC4_5F30_6DC9_C882u64;
+    assert_eq!(hw + 1, (1.0 / std::f64::consts::TAU).to_bits(), "the nearest double is one above");
+    for (dword, want) in [(5u8, hw as u32), (6, (hw >> 32) as u32)] {
+        let mut body = vop3(0x164, 5, 248, vgpr(1), 0).to_vec(); // v_add_f64 v[5:6], 1/(2pi), v[1:2]
+        body.push(vop1(0x001, 0, vgpr(dword))); // v_mov_b32 v0, v5 / v6
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &[[0, 0, 0, 0]], |backend, _, _, got| {
+            assert_eq!(got, want, "{backend}: dword v{dword}");
+        });
+    }
+}
+
 /// The lane `v_permlane16_b32` (`cross` false) or `v_permlanex16_b32` reads
 /// for `lane`, with selector dwords `s1` (lanes 0-7 of a row) and `s2`.
 fn permlane_source(lane: u32, s1: u32, s2: u32, cross: bool) -> u32 {
