@@ -418,6 +418,15 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             {
                 #[cfg(feature = "diagnostics")]
                 sites::patched();
+                // Once per place: where `VICTORY_PROFILE` samples of the spin
+                // loop around it fall (`module+rva`, as the profile names frames).
+                #[cfg(feature = "diagnostics")]
+                tracing::info!(
+                    kind = ?what,
+                    at = format_args!("{rip:#x}"),
+                    place = %crate::crash::locate(rip),
+                    "a console wait replaced in the title's code (VICTORY_PATCH_WAITS)"
+                );
             }
             std::hint::spin_loop();
         }
