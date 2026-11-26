@@ -442,6 +442,17 @@ impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+        Self::new_with(shaders, g, None)
+    }
+
+    /// As [`new`], with `fallback` (`Some((hash, mnemonic))`) naming one of
+    /// the shaders whose culprit mnemonic is translated as a no-op: the
+    /// driver-crash fallback cached by the translate path's bisect.
+    pub(crate) fn new_with(
+        shaders: &[Arc<Shader>],
+        g: Option<&GraphicsState>,
+        fallback: Option<(&str, &str)>,
+    ) -> Option<HostPipeline> {
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
         super::library::label(format!("{shaders:?}"));
@@ -480,7 +491,7 @@ impl HostPipeline {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
         for (s, _) in &stages {
-            s.translated()?;
+            s.translated_for(fallback)?;
         }
         let host = host()?;
 
@@ -505,7 +516,7 @@ impl HostPipeline {
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
         for &(shader, visibility) in &stages {
-            let t = &shader.translated()?.host;
+            let t = &shader.translated_for(fallback)?.host;
             let mut stage = Stage {
                 shader: shader.clone(),
                 user_data: None,
@@ -629,7 +640,7 @@ impl HostPipeline {
             }
         };
         let code = |i: usize| {
-            stages.get(i).and_then(|(s, _)| s.translated()).map_or(
+            stages.get(i).and_then(|(s, _)| s.translated_for(fallback)).map_or(
                 D3D12_SHADER_BYTECODE::default(),
                 |t| D3D12_SHADER_BYTECODE {
                     pShaderBytecode: t.host.dxil.as_ptr().cast(),
@@ -735,8 +746,8 @@ impl HostPipeline {
         // fall back on what `draw` does for rectangles.
         let mut rect_gs = None;
         if g.topology.0 == RECTANGLES {
-            let ps = stages.get(1).and_then(|(s, _)| s.translated());
-            let vs = &stages[0].0.translated()?.host.dxil;
+            let ps = stages.get(1).and_then(|(s, _)| s.translated_for(fallback));
+            let vs = &stages[0].0.translated_for(fallback)?.host.dxil;
             match victory_shader::emit::rect_list_gs(vs, ps.map(|t| &t.host.dxil[..])) {
                 Ok(gs) => rect_gs = Some(gs),
                 Err(e) => tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage"),

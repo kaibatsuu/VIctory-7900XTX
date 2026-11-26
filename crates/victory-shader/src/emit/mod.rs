@@ -415,12 +415,20 @@ pub struct UserData {
 /// already translated came out changed (an extra evaluation in each), for
 /// the sake of 9 that did not translate.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
-    match translate_plain(container) {
+    translate_with(container, &lower::disabled_from_env())
+}
+
+/// As [`translate`], with the mnemonics of `disabled` lowered as no-ops: the
+/// run path's fallback for a shader whose normal translation the host driver
+/// miscompiles (`VICTORY_DISABLE_MNEMONIC` is [`translate`]'s env form of the
+/// same, for the offline bisect's child processes).
+pub fn translate_with(container: &[u8], disabled: &[String]) -> Result<HostShader, ShaderError> {
+    lower::with_disabled_mnemonics(disabled, || match translate_plain(container) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
             lower::with_first_half_pairs(|| translate_plain(container))
         }
         other => other,
-    }
+    })
 }
 
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {

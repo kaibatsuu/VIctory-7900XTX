@@ -1160,6 +1160,37 @@ pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
     result
 }
 
+/// The mnemonics named in `VICTORY_DISABLE_MNEMONIC` (comma-separated), for
+/// the offline bisect's child processes ([`super::translate`]); the run path
+/// passes its shader's culprit explicitly ([`with_disabled_mnemonics`]).
+pub(super) fn disabled_from_env() -> Vec<String> {
+    std::env::var("VICTORY_DISABLE_MNEMONIC")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+thread_local! {
+    /// The mnemonics being lowered as no-ops in this thread's current
+    /// translation ([`with_disabled_mnemonics`]): one shader's fallback
+    /// applies to it alone, not to every shader the process translates.
+    static DISABLED_MNEMONICS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` with the mnemonics of `disabled` lowered as no-ops (each writes
+/// 0 to its destination registers): the driver-crash bisect's fallback.
+/// Scoped to `f` and to this thread, so the run path translates one shader
+/// with its culprit while the others stay as they are.
+pub(super) fn with_disabled_mnemonics<R>(disabled: &[String], f: impl FnOnce() -> R) -> R {
+    let before = DISABLED_MNEMONICS.replace(disabled.to_vec());
+    let result = f();
+    DISABLED_MNEMONICS.set(before);
+    result
+}
+
 pub(super) fn host_max_wave() -> u32 {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
@@ -5275,7 +5306,7 @@ impl<'a> Lower<'a> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();
-        if Self::disabled_mnemonics().iter().any(|m| m == name) {
+        if DISABLED_MNEMONICS.with(|d| d.borrow().iter().any(|m| m == name)) {
             // No-op: write 0 to every register dword the instruction writes,
             // so its result is well-defined for whoever reads it. VALU has no
             // side effects, so that alone is complete there; for a consuming
@@ -7700,23 +7731,6 @@ impl<'a> Lower<'a> {
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
         Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
-    }
-
-    /// The mnemonics named in `VICTORY_DISABLE_MNEMONIC` (comma-separated):
-    /// each is lowered as a no-op that writes 0 to its destination registers.
-    /// A bisect tool: the shader stays complete and compilable while the one
-    /// mnemonic whose translation makes the host driver crash is found.
-    fn disabled_mnemonics() -> &'static [String] {
-        static DISABLED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-        DISABLED.get_or_init(|| {
-            std::env::var("VICTORY_DISABLE_MNEMONIC")
-                .unwrap_or_default()
-                .split(',')
-                .map(str::trim)
-                .filter(|m| !m.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
     }
 
     /// The mnemonics named in `VICTORY_FALLBACK_MNEMONIC` (comma-separated):

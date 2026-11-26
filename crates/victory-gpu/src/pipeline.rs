@@ -66,6 +66,10 @@ pub(crate) struct Shader {
     pub(crate) ambient: Option<crate::ambient::Role>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// Its translation with the driver-crash fallback mnemonic disabled
+    /// ([`Shader::translated_disabled`]), apart from the normal translation.
+    #[cfg(windows)]
+    translated_fallback: OnceLock<Option<Translated>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -118,6 +122,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                translated_fallback: OnceLock::new(),
             })
         })
         .clone()
@@ -182,6 +188,24 @@ impl Shader {
             })
             .as_ref()
     }
+
+    /// The translation made with `mnemonic` lowered as a no-op: the fallback
+    /// for a shader whose normal translation the host driver miscompiles.
+    /// Cached apart from [`translated`], so the normal translation is kept.
+    pub(crate) fn translated_disabled(&self, mnemonic: &str) -> Option<&Translated> {
+        self.translated_fallback
+            .get_or_init(|| translate_with(&self.container, &[mnemonic.to_owned()]).ok())
+            .as_ref()
+    }
+
+    /// The translation for this shader under `fallback` (`Some((hash,
+    /// mnemonic))` names this shader's culprit), else the normal translation.
+    pub(crate) fn translated_for(&self, fallback: Option<(&str, &str)>) -> Option<&Translated> {
+        match fallback {
+            Some((hash, mnemonic)) if hash == self.hash.as_str() => self.translated_disabled(mnemonic),
+            _ => self.translated(),
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -197,6 +221,11 @@ impl Shader {
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
+    translate_with(container, &[])
+}
+
+#[cfg(windows)]
+fn translate_with(container: &[u8], disabled: &[String]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
@@ -205,7 +234,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
+    let host = crate::shader_cache::host_shader_with(container, disabled)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let threads = programs.iter().find_map(|p| match &p.io {
         victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),

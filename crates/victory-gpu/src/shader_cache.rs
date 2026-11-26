@@ -115,11 +115,34 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    host_shader_with(container, &[])
+}
+
+/// As [`host_shader`], with the mnemonics of `disabled` lowered as no-ops
+/// (the driver-crash bisect's fallback). The disabled set is part of the
+/// translation fingerprint, so a fallback translation is cached apart from
+/// the normal one.
+pub(crate) fn host_shader_with(container: &[u8], disabled: &[String]) -> Result<HostShader, String> {
+    let translate = |c: &[u8]| victory_shader::emit::translate_with(c, disabled).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate),
+        Some(cache) => cached(cache, &build_with(disabled), container, translate),
         None => translate(container),
     }
+}
+
+/// [`build`] with the disabled mnemonics folded in, so a fallback
+/// translation is cached apart from the normal one.
+fn build_with(disabled: &[String]) -> [u8; 32] {
+    if disabled.is_empty() {
+        return build();
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(&build());
+    for m in disabled {
+        h.update(&(m.len() as u64).to_le_bytes());
+        h.update(m.as_bytes());
+    }
+    *h.finalize().as_bytes()
 }
 
 /// The cache entry's converter: the build and the container in, the

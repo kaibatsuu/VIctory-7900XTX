@@ -109,7 +109,7 @@ fn isolate() -> bool {
 fn isolated_make(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> Option<HostPipeline> {
     let bytes = super::known::pending(shaders, graphics);
     if !canary(&bytes, None) {
-        let Some(mnemonic) = fallback_for(shaders) else {
+        let Some((hash, mnemonic)) = fallback_for(shaders) else {
             tracing::warn!(
                 ?shaders,
                 "no host pipeline: the driver crashed compiling it (isolated in a child process)"
@@ -126,11 +126,10 @@ fn isolated_make(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> O
             );
             return None;
         }
-        // SAFETY: set before this pipeline is translated; the child above
-        // already confirmed the disabled mnemonic makes the driver compile.
-        unsafe { std::env::set_var("VICTORY_DISABLE_MNEMONIC", mnemonic) };
         tracing::info!(?shaders, %mnemonic, "host pipeline made with the cached fallback");
-        return HostPipeline::new(shaders, graphics);
+        // The mnemonic is passed into this one shader's translation, not set
+        // process-wide, so other shaders are untouched.
+        return HostPipeline::new_with(shaders, graphics, Some((hash.as_str(), mnemonic)));
     }
     HostPipeline::new(shaders, graphics)
 }
@@ -177,11 +176,13 @@ fn fallbacks_file() -> std::path::PathBuf {
 }
 
 /// The mnemonic cached for any of `shaders`, for this driver.
-fn fallback_for(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+/// The fallback for any of `shaders`, for this driver: `(shader hash,
+/// mnemonic)`.
+fn fallback_for(shaders: &[Arc<Shader>]) -> Option<(String, &'static str)> {
     let driver = crate::host::host().map(|h| h.driver()).unwrap_or(0);
     shaders.iter().find_map(|s| {
         let key = (s.hash.clone(), driver);
-        fallbacks().get(&key).map(|m| m.as_str())
+        fallbacks().get(&key).map(|m| (s.hash.clone(), m.as_str()))
     })
 }
 
