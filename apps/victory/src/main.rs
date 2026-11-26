@@ -169,6 +169,14 @@ enum Console {
 
 fn main() -> Result<()> {
     victory_core::logging::init("info");
+    // AMD's driver compiler (`amdxc64`) crashes on the translator's `REUSE`
+    // pass; set the workaround before anything opens the shader cache (its
+    // key reads `shader_opt` before the device is made). `VICTORY_AMD_COMPILER_FIX=0`
+    // keeps the pass.
+    victory_shader::emit::set_amd_compiler_fix(
+        victory_shader::emit::host::detect_amd()
+            && std::env::var("VICTORY_AMD_COMPILER_FIX").ok().is_none_or(|v| v != "0"),
+    );
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {

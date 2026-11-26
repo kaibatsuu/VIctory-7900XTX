@@ -62,6 +62,26 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// Whether the machine's primary hardware adapter is AMD, found without
+/// making a device, so the compiler workaround can be set before the shader
+/// cache is opened (its key reads `shader_opt` before any device is made).
+pub fn detect_amd() -> bool {
+    // SAFETY: plain DXGI queries.
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return false;
+        };
+        let mut i = 0u32;
+        while let Ok(adapter) = factory.EnumAdapters1(i) {
+            if let Ok(desc) = adapter.GetDesc1() && desc.Flags & 2 == 0 {
+                return desc.VendorId == 0x1002;
+            }
+            i += 1;
+        }
+        false
+    }
+}
+
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {

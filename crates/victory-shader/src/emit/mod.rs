@@ -220,7 +220,29 @@ pub fn builder_bounds() -> bool {
 /// does).
 pub fn shader_opt() -> u32 {
     static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+    *PASSES.get_or_init(|| {
+        let parsed = parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref());
+        opt_passes(parsed, AMD_COMPILER_FIX.load(std::sync::atomic::Ordering::Relaxed))
+    })
+}
+
+/// [`set_amd_compiler_fix`]: with AMD's driver the `REUSE` pass (`4`) emits
+/// DXIL that `amdxc64` crashes on (access violation at `+0x861b9f`); once
+/// the host knows its adapter is AMD it sets this, and [`shader_opt`] then
+/// drops that one pass. The module still computes the same values and has
+/// the same effects: `REUSE` only collapses two side-effect-free
+/// instructions that make the same value into one. Off by default; set it
+/// before the first [`shader_opt`] call (the device is made first).
+static AMD_COMPILER_FIX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turns the AMD-compiler workaround on or off (see [`AMD_COMPILER_FIX`]).
+pub fn set_amd_compiler_fix(on: bool) {
+    AMD_COMPILER_FIX.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The passes `parsed` with the AMD-compiler fix applied, if it is on.
+fn opt_passes(parsed: u32, amd_fix: bool) -> u32 {
+    if amd_fix { parsed & !bitcode::opt::REUSE } else { parsed }
 }
 
 /// On a host whose shaders run on the console's own kind of hardware (AMD

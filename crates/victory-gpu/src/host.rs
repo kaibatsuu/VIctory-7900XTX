@@ -939,6 +939,12 @@ fn create() -> windows::core::Result<Host> {
             // (RDNA has waves of 32 and 64, the vendor's older cards of 64 alone.)
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
+            // AMD's driver compiler (`amdxc64`) crashes on the `REUSE`
+            // pass's DXIL (access violation at `+0x861b9f`); drop it on AMD
+            // (`VICTORY_AMD_COMPILER_FIX=0` keeps it).
+            victory_shader::emit::set_amd_compiler_fix(
+                amd && std::env::var("VICTORY_AMD_COMPILER_FIX").ok().is_none_or(|v| v != "0"),
+            );
         }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
