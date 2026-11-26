@@ -1231,6 +1231,77 @@ mod tests {
         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
     }
 
+    /// (Op-lite/victory-scarlett c45b43e's `VICTORY_EARLY_DEPTH`) A pixel
+    /// program the console tests before it runs (`DB_SHADER_CONTROL` bit 12)
+    /// declares `ForceEarlyDepthStencil`: `dxc` writes the entry's shader
+    /// flags as `!{i32 0, i64 8}` for `[earlydepthstencil]`, and nothing in
+    /// `SFI0`. A program that exports depth is not declared: the host cannot
+    /// test before a shader that writes the depth. `VICTORY_EARLY_DEPTH=0`
+    /// is the switch's off, so the rule is tested on its own too.
+    #[test]
+    fn a_pixel_program_tested_before_it_runs_declares_early_depth() {
+        // v_mov_b32 v0, 1.0; exp mrt0 v0, v0, v0, v0 done vm; s_endpgm
+        let color = [0x7E00_02F2u32, 0xF800_180F, 0x0000_0000, 0xBF81_0000];
+        // v_mov_b32 v0, 1.0; exp mrtz v0, off, off, off done vm; s_endpgm
+        let depth = [0x7E00_02F2u32, 0xF800_1881, 0x0000_0000, 0xBF81_0000];
+        let el = |name: &str, kind: u8, cols: u8| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            // A render target has a register; depth and stencil do not.
+            row: (kind == 16).then_some(0),
+            col: 0,
+            cols,
+            usage: (1 << cols) - 1,
+            half: false,
+        };
+        let ps = |db: u32| StageIo::Ps {
+            inputs: vec![],
+            input_addr: 0,
+            db_shader_control: db,
+            patches: vec![],
+        };
+        let emitted = |words: &[u32], out: SigElement, db: u32| {
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 1,
+                layout: vec![],
+                used: vec![],
+                io: ps(db),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let osg1 = container::signature(&[out], false);
+            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            emit(&c, &native, &p, &st, &io, &res).unwrap().dxil
+        };
+        let late = emitted(&color, el("SV_Target", 16, 4), 0x50);
+        let early = emitted(&color, el("SV_Target", 16, 4), 0x1050);
+        assert_ne!(late, early, "the early-depth flag changed nothing");
+        #[cfg(windows)]
+        if let Some(dump) = dump_dxil(&early) {
+            assert!(dump.contains("i64 8"), "early depth not declared:\n{dump}");
+        }
+        let late = emitted(&depth, el("SV_Depth", 17, 1), 0x51);
+        let early = emitted(&depth, el("SV_Depth", 17, 1), 0x1051);
+        assert_eq!(late, early, "early depth declared for a depth export");
+        // The rule alone: bit 12, and no export of depth, stencil or coverage.
+        assert!(lower::early_depth(&ps(0x1450), &[]));
+        assert!(lower::early_depth(&ps(0x1010), &[]));
+        assert!(!lower::early_depth(&ps(0x0450), &[]));
+        assert!(!lower::early_depth(&ps(0x1012), &[]));
+        assert!(!lower::early_depth(&ps(0x1150), &[]));
+        assert!(!lower::early_depth(&ps(0x1050), &[el("SV_StencilRef", 20, 1)]));
+        assert!(!lower::early_depth(&StageIo::None, &[]));
+    }
+
     /// A level query (`image_get_lod`) of a 2D array passes no array slice:
     /// DXIL's `CalculateLOD` takes the spatial coordinates only and the
     /// validator refuses a defined third one ("out of bound coord must be

@@ -106,6 +106,10 @@ pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
+    /// `ForceEarlyDepthStencil` (`[earlydepthstencil]`, the console's
+    /// `DB_SHADER_CONTROL` bit 12): no `SFI0` bit; `dxc` writes it as the
+    /// entry's shader flags alone ([`super::lower::early_depth`]).
+    pub const EARLY_DEPTH: u64 = 1 << 3;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;

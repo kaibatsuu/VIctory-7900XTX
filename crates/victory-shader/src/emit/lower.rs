@@ -1739,6 +1739,43 @@ fn packed_half(
     })
 }
 
+/// Whether a pixel program runs its depth and stencil tests before the
+/// shader on the console (`DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`, bit 12:
+/// HLSL's `[earlydepthstencil]`), so that the host is told too
+/// (`ShaderFlags` `ForceEarlyDepthStencil`, bit 3: `dxc` writes
+/// `!{i32 0, i64 8}` as the entry's shader flags for it). Without it the
+/// host tests after the shader, and a program that writes unordered views
+/// writes them for pixels the depth test then rejects.
+///
+/// Not for a program that exports depth, stencil or coverage: their values
+/// are the shader's, and a test before it would need them earlier. The
+/// exports are `DB_SHADER_CONTROL` bits 0-2, coverage to mask bit 8, and the
+/// output signature's `SV_Depth`, `SV_DepthLessEqual`, `SV_DepthGreaterEqual`,
+/// `SV_Coverage` and `SV_StencilRef` (semantic kinds 17-20 and 14).
+///
+/// `VICTORY_EARLY_DEPTH=0`: never declared, as before. (From
+/// Op-lite/victory-scarlett c45b43e's `VICTORY_EARLY_DEPTH`; the console bit
+/// is what the console's own compiler reads.)
+pub(super) fn early_depth(io: &StageIo, outputs: &[SigElement]) -> bool {
+    const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+    const EXPORTS: u32 = 0b111 | 1 << 8;
+    let StageIo::Ps {
+        db_shader_control, ..
+    } = io
+    else {
+        return false;
+    };
+    db_shader_control & DEPTH_BEFORE_SHADER != 0
+        && db_shader_control & EXPORTS == 0
+        && !outputs.iter().any(|o| matches!(o.kind, 14 | 17 | 18 | 19 | 20))
+}
+
+/// `VICTORY_EARLY_DEPTH=0`: [`early_depth`] is never declared (on otherwise).
+fn early_depth_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_DEPTH").is_none_or(|v| v != "0"))
+}
+
 /// The pixel inputs packing two 16-bit rows per dword, as (first row,
 /// second row) ([`packed_layout`]).
 fn input_packs(io: &StageIo, inputs: &[SigElement]) -> Vec<(u8, Option<u8>)> {
@@ -1844,6 +1881,9 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        if early_depth_on() && early_depth(&x.native.io, &x.outputs) {
+            s.flags |= flags::EARLY_DEPTH;
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
