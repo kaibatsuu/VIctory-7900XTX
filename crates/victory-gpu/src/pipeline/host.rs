@@ -411,6 +411,33 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+/// Whether some compute shader of `shaders` holds `name` (its bytes are in
+/// the container).
+fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
+    shaders
+        .iter()
+        .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+}
+
+/// Why a pipeline with these shaders is left out before the host compiles
+/// it, if it is (ported from victory-amd): ray-tracing hit-shading has
+/// nothing to shade while the structure builder is off, and the
+/// screen-probes' ray activation costs AMD's compiler a core and about a
+/// gigabyte for over a minute.
+fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    let rt_off = std::env::var_os("VICTORY_RT_RESOLVE").is_none_or(|v| v != "1")
+        && std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1");
+    if rt_off && named(shaders, b"CS_RaytracingResolve") {
+        Some("ray-tracing resolve, left out while the structure builder is off")
+    } else if std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0")
+        && named(shaders, b"CS_ScreenProbes_ActivateRays")
+    {
+        Some("screen probes' ray activation, left out (VICTORY_ACTIVATE_RAYS=0)")
+    } else {
+        None
+    }
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
@@ -418,6 +445,9 @@ impl HostPipeline {
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
         super::library::label(format!("{shaders:?}"));
+        if let Some(why) = left_out(shaders) {
+            return refuse(why, shaders);
+        }
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),
