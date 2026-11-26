@@ -209,10 +209,11 @@ impl Detached {
     }
 }
 
-/// A host list that has run and waits to be used again, and the bytes of
-/// upload memory it keeps.
+/// A host list that has run and waits to be used again, the bytes of
+/// upload memory it keeps, and when it was put there
+/// ([`crate::host::moment`], for [`let_go_idle_lists`]).
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64);
+struct Idle(crate::host::HostList, u64, u64);
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
@@ -253,13 +254,13 @@ fn fresh_list() -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
-        if let Some(Idle(_, bytes)) = &taken {
+        if let Some(Idle(_, bytes, _)) = &taken {
             idle.1 -= bytes;
         }
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
+        Some(Idle(list, _, _)) => Some(list),
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
 }
@@ -288,9 +289,72 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
+            idle.0.push(Idle(host, bytes, crate::host::moment()));
             idle.1 += bytes;
         }
+    }
+}
+
+/// The seconds a host list may stay idle before it goes
+/// (`VICTORY_LIST_POOL_IDLE_S`, at most 3600; unset or 0: kept, as before).
+/// An idle list keeps its two command allocators, and the driver keeps what
+/// the longest recording each held needed with them over a reset: up to 512
+/// such lists ([`IDLE_MOST`]) stayed for the whole run (cool_fox's own count:
+/// "lists' allocators 9 GB" of 40-46 GB private). Ported from
+/// Op-lite/victory-scarlett (scarlett f748fb5, there 10 s by default;
+/// scarlett-fox 411a745, off by default). Their idle lists kept the prelude
+/// each had made; ours have none (a submission draws one from the shared
+/// pool, `crate::host` `PRELUDES`, which this leaves alone), so a list let go
+/// gives back its own allocators and lists only. Nor does it touch the lists
+/// of ours that thin recordings give back (`VICTORY_LIST_RELEASE`,
+/// [`thin::give_back_list`]): only host lists in [`IDLE`].
+#[cfg(windows)]
+fn idle_list_ms() -> u64 {
+    static S: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        let s = std::env::var("VICTORY_LIST_POOL_IDLE_S")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(0, |s| s.min(3600));
+        if s > 0 {
+            tracing::info!("host lists idle for {s} s and 60 frames are let go (VICTORY_LIST_POOL_IDLE_S={s})");
+        }
+        s
+    }) * 1000
+}
+
+/// Host lists let go as idle since the start ([`let_go_idle_lists`]).
+#[cfg(windows)]
+static IDLE_LET_GO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Lets go of the host lists that stayed idle for [`idle_list_ms`] and 60
+/// frames. The pool takes the newest list first, so the oldest are those a
+/// burst left. Called once a second by the sweep, before a submission
+/// starts; an idle list has run and was reset, so nothing in the air names
+/// it.
+#[cfg(windows)]
+pub(crate) fn let_go_idle_lists() {
+    let ms = idle_list_ms();
+    if ms == 0 || !pools() {
+        return;
+    }
+    let (went, left) = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let old = idle.0.iter().take_while(|Idle(_, _, put)| crate::host::long_ago(*put, ms, 60)).count();
+        let went: Vec<Idle> = idle.0.drain(..old).collect();
+        idle.1 -= went.iter().map(|Idle(_, bytes, _)| bytes).sum::<u64>();
+        (went, idle.0.len())
+    };
+    if went.is_empty() {
+        return;
+    }
+    let n = went.len() as u64;
+    drop(went);
+    let all = IDLE_LET_GO.fetch_add(n, std::sync::atomic::Ordering::Relaxed) + n;
+    crate::host::trail(|| format!("sweep: {n} idle host lists let go"));
+    // A line when the total passes a power of two.
+    if (all - n).checked_ilog2() != all.checked_ilog2() {
+        tracing::info!(now = n, since_the_start = all, idle_left = left, "idle host lists let go (VICTORY_LIST_POOL_IDLE_S)");
     }
 }
 
