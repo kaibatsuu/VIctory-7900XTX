@@ -1179,6 +1179,10 @@ pub(crate) struct HostTexture {
     pub(crate) holds: std::sync::Arc<Holds>,
     /// Who makes its first upload (`crate::texture::ahead`).
     pub(crate) ahead: std::sync::atomic::AtomicU8,
+    /// Uploads recorded into it (`crate::texture::upload_from`): a delta
+    /// upload is planned only for one that was uploaded before
+    /// (`VICTORY_PARTIAL_DELTA`, `crate::texture::delta`).
+    pub(crate) uploads: std::sync::atomic::AtomicU32,
     /// The texture's flags (asked once: the runtime takes 100 ns to say, and
     /// every texture of every draw is asked about).
     flags: u32,
@@ -2298,6 +2302,7 @@ impl HostTexture {
             grown: Default::default(),
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
+            uploads: Default::default(),
             flags,
         }
     }
@@ -2323,6 +2328,7 @@ impl HostTexture {
             grown: Default::default(),
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
+            uploads: Default::default(),
             flags,
         }
     }
