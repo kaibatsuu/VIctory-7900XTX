@@ -117,6 +117,8 @@ impl Made {
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
+    pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
+    pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
     cpu: usize,
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
@@ -1671,6 +1673,8 @@ impl HostHeap {
         let queued = std::sync::Arc::new(Queued::new(if sampler { 0 } else { count }));
         let h = HostHeap {
             heap,
+            buffer_sweep: Mutex::default(),
+            buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             cpu,
             step,
             count,
