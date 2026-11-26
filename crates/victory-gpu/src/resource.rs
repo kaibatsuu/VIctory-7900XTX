@@ -2099,16 +2099,34 @@ pub(crate) fn let_go_idle() {
     let all = textures();
     // With a limit, the longest idle first.
     let mut by_age: Vec<(u64, usize)> = Vec::new();
+    // (`VICTORY_HEAP_PACK=1`, `crate::pool::heap_pack`) The blocks'
+    // occupancy, for the order.
+    let occupancy = (most != u64::MAX && crate::pool::heap_pack().1).then(crate::pool::Occupancy::now);
     if most != u64::MAX {
+        let mut ranked: Vec<(u64, u64, usize)> = Vec::new();
         for &at in all.iter() {
             // SAFETY: as below.
             let r = unsafe { &*(at as *const Resource) };
             let used = r.host.used.load(Relaxed);
             if used != 0 && fills(&r.desc) && crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
-                by_age.push((used & 0xffff_ffff, at));
+                match &occupancy {
+                    // Sparsest block first, the longest idle within a step.
+                    Some(o) => {
+                        let raw = r.host.made.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |(h, _)| {
+                            windows::core::Interface::as_raw(&h.texture) as usize
+                        });
+                        ranked.push((o.rank(raw), used & 0xffff_ffff, at));
+                    }
+                    None => by_age.push((used & 0xffff_ffff, at)),
+                }
             }
         }
-        by_age.sort_unstable();
+        if occupancy.is_some() {
+            ranked.sort_unstable();
+            by_age = ranked.into_iter().map(|(_, used, at)| (used, at)).collect();
+        } else {
+            by_age.sort_unstable();
+        }
     }
     // Without one, while textures are kept for minutes, a part of them at
     // each look, the next one at the next: a play has over 100,000
@@ -2161,6 +2179,12 @@ pub(crate) fn let_go_idle() {
             }
         };
         if let Some((host, _)) = gone {
+            if let Some(o) = &occupancy
+                && o.sparse(windows::core::Interface::as_raw(&host.texture) as usize)
+            {
+                crate::pool::PACKED[0].fetch_add(1, Relaxed);
+                crate::pool::PACKED[1].fetch_add(host.bytes, Relaxed);
+            }
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
             KINDS[3].fetch_add(host.bytes, Relaxed);

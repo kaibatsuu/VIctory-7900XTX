@@ -892,6 +892,29 @@ fn log_memory() {
     {
         let [textures, staging] = pool;
         tracing::info!("memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures, {staging} MB of their staging buffers");
+        // How full the texture blocks are (`crate::pool::heap_pack`; the
+        // fork's housekeeping line's words).
+        let blocks = crate::pool::texture_blocks();
+        tracing::info!(
+            "texture blocks {} alive ({} empty, {} given back this run); heaps by occupancy: <25 % {}, 25-50 % {}, \
+             50-75 % {}, >75 % {}; free space inside heaps {:.0} MB; copies let go to empty a sparse heap {} ({:.0} MB) \
+             (VICTORY_HEAP_PACK={})",
+            blocks[0],
+            blocks[6],
+            blocks[7],
+            blocks[1],
+            blocks[2],
+            blocks[3],
+            blocks[4],
+            mb(blocks[5]),
+            crate::pool::PACKED[0].load(Relaxed),
+            mb(crate::pool::PACKED[1].load(Relaxed)),
+            match crate::pool::heap_pack() {
+                (true, true) => "1",
+                (true, false) => "place",
+                _ => "0",
+            },
+        );
     }
     let targets = crate::resource::targets_census();
     tracing::info!(
