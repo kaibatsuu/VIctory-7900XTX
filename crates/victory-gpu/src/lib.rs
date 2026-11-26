@@ -39,10 +39,14 @@ pub mod device;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+pub mod external;
 pub mod fence;
 pub mod frame;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
+#[cfg(windows)]
+mod hardware;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
