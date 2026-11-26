@@ -21,6 +21,8 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+mod native;
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
@@ -1434,6 +1436,25 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    let flags = u32::from(bc) | if options & ZLIB != 0 { 8 } else { 0 };
+    // Optional native GDeflate path (`VICTORY_GDEFLATE_PACK`): decode the
+    // block on the GPU from the verified pack, falling back to the CPU
+    // zlib/BCPack decoder below when the bridge or pack is unavailable. The
+    // decoded bytes go through `into_destination` so the title-write guard
+    // and page-list handling stay exactly as they are for the CPU path.
+    if options & MEMORY_SOURCE == 0 {
+        match native::serve(request, &source, flags) {
+            Ok(Some(decoded)) => {
+                into_destination(request, decoded.len(), |out| {
+                    out.copy_from_slice(&decoded);
+                    Ok(decoded.len())
+                })?;
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(hr) => return Err(fail(hr, "gdeflate")),
+        }
+    }
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
         let mut packed = vec![0; request.intermediate_size as usize];

@@ -486,6 +486,7 @@ impl Shader {
         )
     }
 
+    #[cfg(test)]
     /// A specialization constant the shader declares: an internal constant
     /// global whose value [`super::HostShader::specialize`] patches. Returns
     /// the global so a later lowering step can load it (parameterize a bone

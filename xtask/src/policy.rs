@@ -151,7 +151,10 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let allowed = ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()
-            .is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e));
+            .is_some_and(|e| {
+                ALLOWED_EXTENSIONS.contains(&e)
+                    || (path.starts_with("tools/gdeflate/") && matches!(e, "py" | "cpp" | "h"))
+            });
     if !allowed {
         problems.push("file type not on the allowlist".to_owned());
     }

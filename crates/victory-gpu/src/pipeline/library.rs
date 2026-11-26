@@ -262,6 +262,11 @@ pub(crate) fn label(text: String) {
     LABEL.with(|l| *l.borrow_mut() = text);
 }
 
+/// The pipeline this thread is making ([`label`]), for reports.
+pub(crate) fn label_current() -> String {
+    LABEL.with(|l| l.borrow().clone())
+}
+
 /// A library call of this thread, listed in [`CALLS`] until dropped.
 struct Call(u32, u64);
 
@@ -513,22 +518,16 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
-/// The pipeline named `name`: loaded from the library by `load` if it is
-/// there with the same description, else made by `create` and stored.
-pub(crate) fn pipeline(
+/// Loads the pipeline named `name` from the library, if it holds a matching
+/// entry: `None` when it does not (or there is no library). The load reads the
+/// library's file (see [`trim`]); loads of one name wait for each other
+/// ([`same_name`]).
+pub(crate) fn try_load(
     name: &str,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
-    create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
-) -> windows::core::Result<ID3D12PipelineState> {
-    let create = || {
-        let _creating = crate::timeline::span("pipeline: create a PSO in the driver");
-        create()
-    };
+) -> Option<ID3D12PipelineState> {
+    let library = library()?;
     let wide = HSTRING::from(name);
-    let Some(library) = library() else {
-        MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
-    };
     let began = std::time::Instant::now();
     let loaded = {
         let mut loading = crate::timeline::span("pipeline: acquire library load guards");
@@ -538,33 +537,29 @@ pub(crate) fn pipeline(
         loading.next("pipeline: load a PSO from the driver library");
         load(&library.library, PCWSTR(wide.as_ptr()))
     };
-    // The load read the library's file (see `trim`).
     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
     TRIMMED.store(false, Ordering::Relaxed);
-    let refused = match loaded {
+    match loaded {
         Ok(pso) => {
             LOADED.fetch_add(1, Ordering::Relaxed);
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
                 format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
             });
-            return Ok(pso);
+            Some(pso)
         }
-        Err(e) => e,
-    };
-    // Compiled outside any lock: compiles take up to seconds.
-    let pso = {
-        let _call = call("make", name);
-        create()?
-    };
-    MADE.fetch_add(1, Ordering::Relaxed);
-    crate::host::trail(|| {
-        let label = LABEL.with(|l| l.borrow().clone());
-        format!(
-            "pipeline library: made {label} in {:.1} ms (the library did not load it: {refused})",
-            began.elapsed().as_secs_f64() * 1e3
-        )
-    });
+        Err(e) => {
+            tracing::debug!(error = %e, "the host pipeline library did not load it");
+            None
+        }
+    }
+}
+
+/// Stores the made pipeline `pso` under `name` (a name already stored with a
+/// differing description is refused and leaves the library as it was).
+pub(crate) fn store(name: &str, pso: &ID3D12PipelineState) {
+    let Some(library) = library() else { return };
+    let wide = HSTRING::from(name);
     let mut storing = crate::timeline::span("pipeline: acquire library store guards");
     let _all = one_call();
     let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
@@ -572,16 +567,16 @@ pub(crate) fn pipeline(
     storing.next("pipeline: store a PSO in the driver library");
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), pso) }.is_ok() {
         library.added.fetch_add(1, Ordering::Relaxed);
     }
-    Ok(pso)
 }
 
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    static SAVE_LOCK: Mutex<()> = Mutex::new(());
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
@@ -591,12 +586,23 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    // One save at a time: a shutdown save can run beside the periodic one, and
+    // the serialise + rename must not interleave.
+    let _serialized = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _saving = crate::timeline::span("pipeline: save the library and early list");
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
+    // A staging name of our own (a concurrent save cannot share it).
+    static NEXT_TMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = {
+        let mut name = PathBuf::from(LIBRARY_FILE);
+        name.set_extension("tmp");
+        let mut name = name.into_os_string();
+        name.push(format!("-{}-{}", std::process::id(), NEXT_TMP.fetch_add(1, Ordering::Relaxed)));
+        dir.join(name)
+    };
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
@@ -659,6 +665,27 @@ pub(crate) fn save(now: bool) {
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
     }
+}
+
+/// Starts the background saver once (`victory-library-saver`): it saves the
+/// library every 30 s, off the pipeline workers, deferring while requested or
+/// screen pipelines are queued. The shutdown save ([`save`] with `now`) runs
+/// regardless.
+pub(crate) fn start_saver() {
+    static ON: OnceLock<()> = OnceLock::new();
+    ON.get_or_init(|| {
+        if let Err(e) = std::thread::Builder::new()
+            .name("victory-library-saver".into())
+            .spawn(|| loop {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                if super::make::queues_empty() {
+                    save(false);
+                }
+            })
+        {
+            tracing::warn!(error = %e, "no pipeline library saver thread");
+        }
+    });
 }
 
 /// Writes the library's `size` serialised bytes to the file `tmp`: through

@@ -155,6 +155,12 @@ enum Command {
     MakePending {
         file: PathBuf,
     },
+    /// (The child of a run's `VICTORY_PIPELINE_ISOLATE=1` fast path.) A
+    /// persistent process that makes many serialised pipelines, framed over
+    /// its pipes; a driver crash ends this process, which the run reads as a
+    /// crash.
+    #[cfg(windows)]
+    CanaryWorker,
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -265,6 +271,16 @@ fn main() -> Result<()> {
             victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
             let bytes = std::fs::read(&file)?;
             std::process::exit(i32::from(!victory_hle::known_pipelines::make_pending(&bytes)));
+        }
+        #[cfg(windows)]
+        Command::CanaryWorker => {
+            let cfg = victory_core::Config::load()?;
+            // Translations only: the child never opens or maps the host
+            // pipeline library (the run keeps it), so it compiles each
+            // pipeline fresh and stores to a throwaway library.
+            victory_hle::known_pipelines::use_translations(cfg.cache_subdir("shaders")?);
+            victory_hle::canary_worker();
+            std::process::exit(0);
         }
         Command::Run {
             exe,

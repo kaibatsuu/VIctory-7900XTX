@@ -394,6 +394,7 @@ impl Module {
         g
     }
 
+    #[cfg(test)]
     /// A specialization constant: an internal constant global `spec.const.<id>`
     /// whose initialiser is `value`'s raw 32 bits. `float` makes it an `f32`
     /// (else an `i32`). [`Module::write_with_specs`] reports where its value
@@ -593,6 +594,7 @@ impl Module {
         live
     }
 
+    #[cfg(test)]
     pub fn write(&self) -> Vec<u8> {
         self.write_with_specs().0
     }

@@ -337,6 +337,16 @@ pub(crate) fn pending(
 /// host pipeline; the pipeline object itself is let go (the run makes its own
 /// after this canary tells it the compile does not crash).
 pub fn make_pending(bytes: &[u8]) -> bool {
+    // The run's driver-crash fallback for one of the shaders, if it is being
+    // checked: made as the run will make it.
+    let fallback = std::env::var(PENDING_FALLBACK).ok();
+    let fallback = fallback.as_deref().and_then(|v| v.split_once(' '));
+    make_pending_with(bytes, fallback)
+}
+
+/// As [`make_pending`], with the fallback given directly: a persistent
+/// canary worker's framed request names it, not this process's environment.
+pub fn make_pending_with(bytes: &[u8], fallback: Option<(&str, &str)>) -> bool {
     let Some((&count, mut rest)) = bytes.split_first() else {
         return false;
     };
@@ -373,10 +383,6 @@ pub fn make_pending(bytes: &[u8]) -> bool {
         };
         Some(Box::new(g))
     };
-    // The run's driver-crash fallback for one of the shaders, if it is being
-    // checked: made as the run will make it.
-    let fallback = std::env::var(PENDING_FALLBACK).ok();
-    let fallback = fallback.as_deref().and_then(|v| v.split_once(' '));
     HostPipeline::new_with(&shaders, graphics.as_deref(), &spec_constants, fallback).is_some()
 }
 

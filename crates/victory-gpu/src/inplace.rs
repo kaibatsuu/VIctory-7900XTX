@@ -569,6 +569,40 @@ fn stretch_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usiz
     Some((start, stop - start, section, (start as i128 - delta) as u64))
 }
 
+/// Number of whole-section views currently mapped by [`beside`] and the sum of
+/// their section sizes in bytes.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn whole_views_bytes() -> (usize, u64) {
+    let v = views();
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    for &(section, base) in &v.whole {
+        if base != 0 {
+            count += 1;
+            if let Some(&(_, sz, _)) = v.sections.iter().find(|s| s.0 == section) {
+                bytes += sz;
+            }
+        }
+    }
+    (count, bytes)
+}
+
+/// Unlocks `[offset, offset + len)` in the whole-section view kept by
+/// [`beside`] for `section`, if one is mapped. Holds the read lock on `VIEWS`
+/// during `VirtualUnlock` so [`title_memory_section_gone`] cannot unmap it
+/// concurrently.
+pub(crate) fn unlock_beside(section: usize, offset: u64, len: usize) {
+    let v = views();
+    if let Some(&(_, base)) = v.whole.iter().find(|w| w.0 == section)
+        && base != 0
+    {
+        // SAFETY: `v` holds `VIEWS` read-locked so `title_memory_section_gone`
+        // cannot unmap this view concurrently; `VirtualUnlock` only removes
+        // pages from the working set (harmless if not locked).
+        unsafe { mem::VirtualUnlock((base + offset as usize) as *const c_void, len) };
+    }
+}
+
 /// Another address of the title memory `[at, at + len)`, if it is a view of
 /// the title's pages, all of it one run of a section: in a view of ours of
 /// the whole section, which is never guarded (`crate::watch`) nor changed.
@@ -1521,5 +1555,10 @@ pub(crate) mod tests {
             views_gone(view as usize, 3 * K64);
             mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn unlock_beside_ignores_unknown_section() {
+        super::unlock_beside(0, 0, K64);
     }
 }

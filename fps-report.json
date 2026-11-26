@@ -1,0 +1,25 @@
+{
+  "method": "KLBF Lab shared measurement (docs/klbf/MEASUREMENT.md)",
+  "build": "combined",
+  "gpu": "RX 9070 XT 16 GB",
+  "cpu": "Ryzen 7 9800X3D",
+  "minutes": 14.5,
+  "average": 12.4,
+  "median": 11.0,
+  "low_5pct": 9.7,
+  "low_1pct": 9.0,
+  "peak": 26.7,
+  "stability_index_pct": {
+    "18+": 13,
+    "15-18": 4,
+    "12-15": 3,
+    "9-12": 80,
+    "5-9": 0,
+    "<5": 0
+  },
+  "samples": 166,
+  "from_utc": "2026-11-26T10:37:04",
+  "to_utc": "2026-11-26T10:51:32",
+  "log_sha256_16": "9912be6d140c16bc",
+  "consistency": "ok"
+}

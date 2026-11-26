@@ -261,6 +261,11 @@ extern "system" fn window_proc(
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
     }
+    // Mouse look (`mouse`): capture on click, raw motion, release on Alt
+    // or focus loss.
+    if let Some(r) = crate::modules::mouse::message(hwnd, message, wparam, lparam) {
+        return r;
+    }
     // SAFETY: the procedure `hook` stored, called the way the system would.
     unsafe {
         let title = wm::GetPropW(hwnd, TITLE_PROC);

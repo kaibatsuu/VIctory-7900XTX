@@ -61,6 +61,12 @@ pub(crate) struct Host {
     /// no sampler heap ([`fallback_heaps`]).
     fallback_view: OnceLock<Option<ID3D12DescriptorHeap>>,
     fallback_sampler: OnceLock<Option<ID3D12DescriptorHeap>>,
+    /// Whether anisotropic filtering with point mip filtering is supported
+    /// (queried once).
+    pub(crate) aniso_point_mip: OnceLock<bool>,
+    /// Root signatures by their bindings, per device: many pipelines share one.
+    pub(crate) root_signatures:
+        OnceLock<Mutex<std::collections::HashMap<[u8; 32], (ID3D12RootSignature, std::sync::Arc<[u8]>)>>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -1115,6 +1121,8 @@ fn create() -> windows::core::Result<Host> {
             adapter,
             fallback_view: OnceLock::new(),
             fallback_sampler: OnceLock::new(),
+            aniso_point_mip: OnceLock::new(),
+            root_signatures: OnceLock::new(),
         })
     }
 }
@@ -1125,6 +1133,24 @@ impl Host {
         let adapter = self.adapter.as_ref();
         // SAFETY: a plain query.
         adapter.map_or(0, |a| unsafe { a.CheckInterfaceSupport(&IDXGIDevice::IID) }.unwrap_or(0))
+    }
+
+    /// Whether the host GPU supports anisotropic filtering with point mip
+    /// filtering (queried once; older runtimes may not know the feature, which
+    /// means no support).
+    pub(crate) fn aniso_point_mip(&self) -> bool {
+        *self.aniso_point_mip.get_or_init(|| {
+            let mut options = windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+            // SAFETY: the feature query writes the structure of the given size.
+            let ok = unsafe {
+                self.device.CheckFeatureSupport(
+                    windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_D3D12_OPTIONS19,
+                    (&raw mut options).cast(),
+                    std::mem::size_of_val(&options) as u32,
+                )
+            };
+            ok.is_ok() && options.AnisoFilterWithPointMipSupported.as_bool()
+        })
     }
 }
 

@@ -41,6 +41,12 @@ as it was, with one correction (XCL, under its Credits).
   the title's `Sleep(0)`, `SleepEx` and `SwitchToThread` and logs them per frame;
   each `monitorx`/`mwaitx` replaced in the title's code is logged with its place,
   so `VICTORY_PROFILE` samples can be matched to the spin loops around them.
+- **Mouse controls** (on by default): left-clicking the title window captures
+  the cursor and turns raw mouse motion into the pad's right stick; left/right
+  mouse buttons pull the right/left triggers and middle-click presses the right
+  stick. `Alt` or losing focus releases the cursor. `VICTORY_MOUSE=0` turns it
+  off; `VICTORY_MOUSE_FULL`, `VICTORY_MOUSE_SMOOTH_MS`,
+  `VICTORY_MOUSE_DEADZONE` and `VICTORY_MOUSE_INVERT=1` tune it.
 
 ## How to run it
 

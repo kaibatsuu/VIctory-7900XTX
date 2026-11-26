@@ -137,8 +137,30 @@ pub fn frames_begun() -> u64 {
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
+pub fn unlock_beside(section: usize, offset: u64, len: usize) {
+    inplace::unlock_beside(section, offset, len);
+}
+#[cfg(windows)]
+pub fn set_xmem_stats(f: fn() -> String) {
+    #[cfg(feature = "diagnostics")]
+    copystat::set_xmem_stats(f);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = f;
+}
+#[cfg(windows)]
+pub fn set_lazy_commit_hook(f: fn(usize) -> bool) {
+    watch::set_lazy_commit_hook(f);
+}
+#[cfg(windows)]
 pub use watch::{
     kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
     title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
     writing as kernel_will_write,
 };
+
+/// The host D3D12 device as a raw pointer, for the optional native GDeflate
+/// bridge (`VICTORY_GDEFLATE_PACK`). `None` until the host device is made.
+#[cfg(windows)]
+pub fn storage_device() -> Option<*mut std::ffi::c_void> {
+    host::host().map(|h| windows::core::Interface::as_raw(&h.device))
+}
