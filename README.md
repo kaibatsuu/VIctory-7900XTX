@@ -1,3 +1,127 @@
+# another-victory-fork
+
+A fork of [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX),
+which is itself a fork of [VIctory](https://github.com/Marvisak/VIctory) by way of
+[fxceless/victory-fork](https://github.com/fxceless/victory-fork): a compatibility
+layer that runs an Xbox Series title natively on Windows through Direct3D 12.
+
+**This repository contains no game files, code or assets.** You need your own copy
+of the game. It is not affiliated with or endorsed by the game's developer or
+publisher.
+
+The default branch, `combined`, is avatarmanz's work with three feature branches
+merged into it and the fixes below. Everything from
+[VIctory on an RX 7900 XTX](#victory-on-an-rx-7900-xtx) down is avatarmanz's README
+as it was, with one correction (XCL, under its Credits).
+
+## What this fork adds
+
+- **Three branches merged**, each on top of the self-healing pipelines (a driver
+  crash in a pipeline compile is bisected to the instruction to disable, and the
+  fallback is cached per shader and driver):
+  - crash fallback at run time: a shader that crashes the driver is made with
+    its culprit instruction disabled instead of being left out;
+  - the submission-preparing thread split in two, opt-in (`VICTORY_SUBMIT_SPLIT=1`);
+  - D3D12 specialization-constant plumbing for compute pipelines (no caller uses it
+    yet).
+- **Pipeline isolation that works** (`VICTORY_PIPELINE_ISOLATE=1`: each new
+  pipeline is first compiled in a child process, so a driver crash costs the child,
+  not the run):
+  - only a child that crashes leaves a pipeline out. Before, any failed exit counted
+    as a crash, and the child refuses some pipelines the run makes fine: about a
+    quarter of the pipelines were left out and the world was not drawn;
+  - pipelines a child has made without a crash are remembered in the cache's
+    `warm-done.txt` (the list `victory warm` keeps, per translator and driver), so
+    later launches skip the test for them;
+  - a shader's cached fallback now reaches the child (`VICTORY_PENDING_FALLBACK`),
+    and is also used without isolation;
+  - at most `VICTORY_CANARY_JOBS` children at once (16 by default), and each child
+    that dies is logged with its exit code.
+- **Measurements** (diagnostics builds): `VICTORY_SLEEP_COUNT=1` counts and times
+  the title's `Sleep(0)`, `SleepEx` and `SwitchToThread` and logs them per frame;
+  each `monitorx`/`mwaitx` replaced in the title's code is logged with its place,
+  so `VICTORY_PROFILE` samples can be matched to the spin loops around them.
+
+## How to run it
+
+You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader model
+6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build tools, and your
+own dump of the title. This fork's changes were tested on one PC: Windows 11, an AMD
+Ryzen 7 9800X3D, a Radeon RX 9070 XT (driver 32.0.32029.2010) and 64 GB of RAM.
+
+```powershell
+git clone https://github.com/kaibatsuu/another-victory-fork
+cd another-victory-fork
+copy victory.example.toml victory.toml      # then set your paths, outside this folder
+cargo build --locked --profile diag -p victory --features diagnostics
+```
+
+(Instead of `victory.toml`, `VICTORY_CACHE_DIR` and `VICTORY_DATA_DIR` can name the
+cache and data folders.) Once per new build or driver, before the first run (both
+can be stopped and go on later):
+
+```powershell
+target\diag\victory.exe shaders <your copy's folder>\shaders.rpf   # every shader translated, about a minute
+target\diag\victory.exe warm --used                                # only after a run with VICTORY_PIPELINE_BOOK=1
+```
+
+Then:
+
+```powershell
+scripts\play.ps1 -Exe <your copy's executable> -More @{VICTORY_PIPELINE_ISOLATE='1'}
+```
+
+With isolation the first launch of a new build stutters for a few minutes while
+each new pipeline is tested; later launches skip those already tested. A child that
+crashes in the driver appears in Windows' event log as an application error of
+`victory.exe`: that is the test doing its job, and the game goes on. Without
+`-More` it runs as avatarmanz's README below describes; `-Safe` and `-RayTracing`
+are as there.
+
+Where it stands (2026-11-26, one PC): the world draws; once loaded, about 53 ms a
+frame (about 19 fps) in the scenes tried, with single frames up to about 200 ms. As
+below, trees and far buildings flicker in places, and the ray-traced resolve is
+left out without `-RayTracing`.
+
+## Where everything comes from
+
+- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
+  contributors, through **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**
+  and **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)**:
+  nearly all of the code; avatarmanz's README below lists who else it carries work
+  from (DexNom, Belobug and romainhedouin, FQY55kai, myokex with Spexivus, joroyt,
+  tightfall and Joshua Odom, Geckomacabre, cxy0072019-sketch). The history is kept,
+  and commits taken from elsewhere name the commit and its author.
+- The DirectStorage worker count by physical cores follows a measurement by
+  soldsawn (`0bba762`, carried in Op-lite/victory-scarlett `f748fb5`).
+- This fork's own commits are the 17 after avatarmanz's `main` (`85d5641`): the
+  self-healing pipelines, the three merged branches and the fixes above. The last
+  three were made with [Claude Code](https://claude.com/claude-code).
+- Code from outside the VIctory family, under its own licence, as its files say:
+  - AMD's addrlib swizzle tables (MIT, Advanced Micro Devices):
+    `crates/victory-formats/src/texture.rs`;
+  - GFX10 opcode names generated from Mesa's ACO (MIT, Valve Corporation):
+    `crates/victory-shader/src/gfx10/opcodes.rs`;
+  - tables and the frame decoder's structure from FFmpeg's WMA Pro decoder
+    (LGPL-2.1-or-later, used under GPL-3.0-or-later as it allows):
+    `crates/victory-formats/src/xma/tables.rs`, `crates/victory-formats/src/xma.rs`;
+  - the console-instruction decoder and emulation from
+    [XCL](https://github.com/ivall/xcl) (GPL-2.0-only):
+    `crates/victory-loader/src/console_insn.rs` and `console_insn_decode.rs`.
+
+**A licensing problem this fork inherits and has not resolved:** XCL is
+GPL-2.0-only, and code under GPL-2.0-only cannot be relicensed under
+GPL-3.0-or-later, the licence of this project. Until that is settled (XCL's
+authors' permission, or those two files written anew), treat them as GPL-2.0-only.
+
+## License
+
+GPL-3.0-or-later, as VIctory (see [LICENSE](LICENSE)), except the files named
+above under their own licences, and the one file named in
+[docs/asset-policy.md](docs/asset-policy.md).
+
+---
+
 # VIctory on an RX 7900 XTX
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
@@ -106,7 +230,10 @@ commits taken from elsewhere name the commit and its author.
   reads into title memory.
 - **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
 - **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
-  title behaves under another layer; no code of it is here.
+  title behaves under another layer. *(Correction by another-victory-fork: this
+  said "no code of it is here", but `crates/victory-loader/src/console_insn.rs`
+  says it and `console_insn_decode.rs` are ported from XCL; see the licensing note
+  at the top.)*
 - This fork's changes were made with [Claude Code](https://claude.com/claude-code).
 
 ## License
