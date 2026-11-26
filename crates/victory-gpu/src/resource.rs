@@ -1190,6 +1190,10 @@ pub(crate) struct HostTexture {
     /// many levels the copy put in (its views show them).
     pub(crate) prefill: std::sync::Mutex<Option<(u32, std::sync::Arc<Vec<u8>>)>>,
     pub(crate) prefilled: std::sync::atomic::AtomicU32,
+    /// Uploads recorded into it (`crate::texture::upload_from`): a delta
+    /// upload is planned only for one that was uploaded before
+    /// (`VICTORY_PARTIAL_DELTA`, `crate::texture::delta`).
+    pub(crate) uploads: std::sync::atomic::AtomicU32,
     /// The texture's flags (asked once: the runtime takes 100 ns to say, and
     /// every texture of every draw is asked about).
     flags: u32,
@@ -2373,6 +2377,7 @@ impl HostTexture {
             ahead: crate::texture::ahead::fresh(),
             prefill: Default::default(),
             prefilled: Default::default(),
+            uploads: Default::default(),
             flags,
         }
     }
@@ -2400,6 +2405,7 @@ impl HostTexture {
             ahead: crate::texture::ahead::fresh(),
             prefill: Default::default(),
             prefilled: Default::default(),
+            uploads: Default::default(),
             flags,
         }
     }
