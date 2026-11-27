@@ -1419,7 +1419,10 @@ fn give_batch_buffers(buffers: Vec<ID3D12Resource>) {
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
-    allocator: ID3D12CommandAllocator,
+    /// Its command allocator and when it was made ([`now_ms`]): with
+    /// [`allocator_trim`] a reset now and then takes a new one, and the old
+    /// one, which keeps the most memory its list ever recorded into it, goes.
+    allocator: Mutex<(ID3D12CommandAllocator, u64)>,
     /// With barriers held and joined (`rec`).
     pub(crate) list: rec::Rec,
     /// Work for submission time, in recorded order.
@@ -1444,8 +1447,9 @@ pub(crate) struct HostList {
     indirects: indirects::Shared,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted, and after
-    /// it what the clamp notes about mesh records. In memory the CPU maps.
-    budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// it what the clamp notes about mesh records. In memory the CPU maps:
+    /// a buffer of its own, or a slot of a shared one ([`budget_pack`]).
+    budget: OnceLock<Option<Budget>>,
     /// The same words in the card's own memory ([`card_budget`]), which the
     /// clamp uses instead when there is one: zeroed in the list before its
     /// first clamp, its notes copied to `budget` when the list closes.
@@ -1476,6 +1480,167 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+}
+
+/// Whether host lists' command allocators are taken anew now and then
+/// (`VICTORY_ALLOCATOR_TRIM=1`; off by default; from
+/// skornuta/victory-memory-stack 0013). A D3D12 command allocator never gives
+/// back the memory of the most its list ever recorded into it: a list that
+/// once took a loading frame's commands keeps that for the run (their
+/// measure: ~1,600 lists and preludes held about 2.3 GB of private memory).
+/// With the switch a list's reset (the one moment its allocator holds
+/// nothing that runs) takes a new allocator when the one it has is
+/// `VICTORY_ALLOCATOR_TRIM_S` seconds old (30; 5 to 3600), and the old one
+/// goes behind the submissions still running ([`retire`]). (Preludes here
+/// come from a shared pool, [`PRELUDES`], so they are left as they are.)
+pub(crate) fn allocator_trim() -> Option<u64> {
+    static S: OnceLock<Option<u64>> = OnceLock::new();
+    *S.get_or_init(|| {
+        std::env::var_os("VICTORY_ALLOCATOR_TRIM").is_some_and(|v| v == "1").then(|| {
+            std::env::var("VICTORY_ALLOCATOR_TRIM_S")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(30u64)
+                .clamp(5, 3600)
+        })
+    })
+}
+
+/// Host list allocators taken anew since the start ([`allocator_trim`]).
+pub(crate) static ALLOCATOR_TRIMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// With [`allocator_trim`]: `slot` (an allocator and when it was made) takes
+/// a new allocator if its own is old enough; the old one is retired. Whether
+/// it did (the new one needs no reset). To be called only where the
+/// allocator's last commands have run.
+fn allocator_refresh(slot: &mut (ID3D12CommandAllocator, u64)) -> bool {
+    let Some(secs) = allocator_trim() else {
+        return false;
+    };
+    let now = now_ms();
+    if now.saturating_sub(slot.1) < secs * 1000 {
+        return false;
+    }
+    let Some(host) = host() else {
+        return false;
+    };
+    // SAFETY: plain object creation.
+    let made: windows::core::Result<ID3D12CommandAllocator> =
+        unsafe { host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) };
+    match made {
+        Ok(fresh) => {
+            let old = std::mem::replace(slot, (fresh, now));
+            retire(old.0);
+            ALLOCATOR_TRIMS.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        Err(_) => {
+            // No new one now: the old one serves on, and is asked again later.
+            slot.1 = now;
+            false
+        }
+    }
+}
+
+/// Whether host lists' indirect-work budgets share buffers
+/// (`VICTORY_BUDGET_PACK=1`; off by default; from skornuta/victory-memory-stack
+/// 0023). A budget is 256 bytes of memory the CPU maps, and each list made a
+/// committed buffer of its own for it, which takes 64 KiB (602 of them held
+/// 37 MB in their first area). With the switch a budget is a 256-byte slot of
+/// a 64 KiB buffer of [`BUDGET_SLABS`], given back behind the submissions
+/// running when its list goes ([`retire`]). Every list puts a slab in the same
+/// state: a copy destination for its card copy's notes
+/// ([`HostList::card_budget_out`], promoted from common), or else unordered
+/// access, and each writes its own slot only. The card copy itself
+/// ([`card_budget`]) stays a buffer of the list's own: barriers name it.
+fn budget_pack() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUDGET_PACK").is_some_and(|v| v == "1"))
+}
+
+const BUDGET_SLOT: u64 = 256;
+const BUDGET_SLAB: u64 = 64 << 10;
+
+/// The budgets' buffers (buffer, mapping) and the free slots (buffer,
+/// offset).
+static BUDGET_SLABS: Mutex<(Vec<(ID3D12Resource, usize)>, Vec<(usize, u64)>)> =
+    Mutex::new((Vec::new(), Vec::new()));
+
+/// A host list's indirect-work budget: a buffer of its own, or a slot of a
+/// shared one.
+enum Budget {
+    Own(ID3D12Resource, usize),
+    Packed(BudgetSlot),
+}
+
+/// A slot of [`BUDGET_SLABS`]: given back when dropped, behind the
+/// submissions running then.
+struct BudgetSlot {
+    slab: usize,
+    offset: u64,
+    data: usize,
+}
+
+/// Gives a slot back when dropped ([`retire`] drops it once the submissions
+/// running at the list's end have finished).
+struct BudgetFree(usize, u64);
+
+impl Drop for BudgetFree {
+    fn drop(&mut self) {
+        BUDGET_SLABS.lock().unwrap_or_else(|e| e.into_inner()).1.push((self.0, self.1));
+    }
+}
+
+impl Drop for BudgetSlot {
+    fn drop(&mut self) {
+        retire(BudgetFree(self.slab, self.offset));
+    }
+}
+
+impl Budget {
+    fn new() -> Option<Budget> {
+        if !budget_pack() {
+            let (buffer, data) = host()?.shared_buffer(BUDGET_SLOT)?;
+            return Some(Budget::Own(buffer, data as usize));
+        }
+        let mut slabs = BUDGET_SLABS.lock().unwrap_or_else(|e| e.into_inner());
+        if slabs.1.is_empty() {
+            let (buffer, data) = host()?.shared_buffer(BUDGET_SLAB)?;
+            name(&buffer, || "indirect budgets".into());
+            let at = slabs.0.len();
+            slabs.0.push((buffer, data as usize));
+            // Taken from the end: the slab's first slot first.
+            slabs.1.extend((0..BUDGET_SLAB / BUDGET_SLOT).rev().map(|k| (at, k * BUDGET_SLOT)));
+        }
+        let (slab, offset) = slabs.1.pop()?;
+        let data = slabs.0[slab].1 + offset as usize;
+        drop(slabs);
+        // A slot given back holds its last list's words: zeroed, as a new
+        // buffer is.
+        // SAFETY: the slot's 256 mapped bytes, ours alone now (its last
+        // list's submissions ran before it was given back).
+        unsafe { std::ptr::write_bytes(data as *mut u8, 0, BUDGET_SLOT as usize) };
+        Some(Budget::Packed(BudgetSlot { slab, offset, data }))
+    }
+
+    /// The buffer and where in it the budget's words begin.
+    fn buffer(&self) -> (ID3D12Resource, u64) {
+        match self {
+            Budget::Own(buffer, _) => (buffer.clone(), 0),
+            Budget::Packed(slot) => {
+                let slabs = BUDGET_SLABS.lock().unwrap_or_else(|e| e.into_inner());
+                (slabs.0[slot.slab].0.clone(), slot.offset)
+            }
+        }
+    }
+
+    /// The budget's words, mapped.
+    fn data(&self) -> usize {
+        match self {
+            Budget::Own(_, data) => *data,
+            Budget::Packed(slot) => slot.data,
+        }
+    }
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -4520,7 +4685,7 @@ impl Host {
                 );
             }
             Ok(HostList {
-                allocator,
+                allocator: Mutex::new((allocator, now_ms())),
                 list: rec::Rec::new(list),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
@@ -7104,12 +7269,15 @@ impl HostList {
                 give_batch_buffers(buffers);
             }
         }
-        // SAFETY: the list is not executing.
+        let mut allocator = self.allocator.lock().unwrap_or_else(|e| e.into_inner());
+        let fresh = allocator_refresh(&mut allocator);
+        // SAFETY: the list is not executing; a fresh allocator is new and
+        // empty.
         let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
+            (if fresh { Ok(()) } else { allocator.0.Reset() })
+                .and_then(|()| self.list.Reset(&allocator.0, None))
         };
+        drop(allocator);
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
@@ -7837,18 +8005,12 @@ impl HostList {
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
-            .budget
-            .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
-            })
-            .as_ref()?;
+        let budget = self.budget.get_or_init(Budget::new).as_ref()?;
         let card = self.card_budget.get_or_init(|| self.make_card_budget()).as_ref();
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
-            let at = *data;
+            let at = budget.data();
             // SAFETY: the list's own mapped words, written before it runs.
             // The words after the budget hold what the clamp noted about the
             // list's last run (mesh dispatches: the largest group count
@@ -7873,8 +8035,15 @@ impl HostList {
                 self.zero_card_budget(card);
             }
         }
-        // SAFETY: a live buffer.
-        Some(unsafe { card.unwrap_or(buffer).GetGPUVirtualAddress() })
+        Some(match card {
+            // SAFETY: a live buffer.
+            Some(card) => unsafe { card.GetGPUVirtualAddress() },
+            None => {
+                let (buffer, offset) = budget.buffer();
+                // SAFETY: a live buffer (the slab outlives every slot of it).
+                unsafe { buffer.GetGPUVirtualAddress() + offset }
+            }
+        })
     }
 
     /// The budget's words in the card's own memory ([`card_budget`]), if
@@ -7926,11 +8095,10 @@ impl HostList {
         if !self.deferred().budget_zeroed {
             return;
         }
-        let (Some(Some(card)), Some(Some((mapped, _)))) =
-            (self.card_budget.get(), self.budget.get())
-        else {
+        let (Some(Some(card)), Some(Some(budget))) = (self.card_budget.get(), self.budget.get()) else {
             return;
         };
+        let (mapped, offset) = budget.buffer();
         // SAFETY: an open list; both buffers are the list's own. The
         // mapped one is promoted from common to the copy destination.
         unsafe {
@@ -7939,7 +8107,7 @@ impl HostList {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            self.list.CopyBufferRegion(mapped, 4, card, 4, 16);
+            self.list.CopyBufferRegion(&mapped, offset + 4, card, 4, 16);
             self.list.ResourceBarrier(&[transition(
                 card,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
