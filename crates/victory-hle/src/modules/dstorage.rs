@@ -787,7 +787,7 @@ pub(crate) mod stream_log {
         let ago = |t: Option<std::time::Instant>| now - t.map_or(0, |t| t.elapsed().as_millis() as u64);
         let r = &job.request;
         line(format_args!(
-            "R\t{}\t{}\t{:x}\t{}\t{}\t{}\t{:x}\t{}\t{}\t{}\t{now}\t{:x}",
+            "R\t{}\t{}\t{:x}\t{}\t{}\t{}\t{:x}\t{}\t{}\t{}\t{now}\t{:x}\t{:x}",
             job.lane,
             job.seq,
             r.source as usize,
@@ -798,7 +798,12 @@ pub(crate) mod stream_log {
             ago(job.note.enqueued),
             ago(job.note.submitted),
             ago(Some(started)),
-            result.err().unwrap_or(0)
+            result.err().unwrap_or(0),
+            // The destination page list as it stood when the bytes landed: two
+            // reads of the same file bytes with the same hash went to the same
+            // place (a genuine re-download), different hashes to different
+            // pages. 0: a read to an address, with no page list at all.
+            super::list_hash(r)
         ));
     }
 }

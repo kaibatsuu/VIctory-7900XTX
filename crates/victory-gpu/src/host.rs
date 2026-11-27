@@ -8316,6 +8316,14 @@ impl HostList {
                         crate::port_journal::prep_wrote();
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    // Diagnostic (`VICTORY_FADE_LOG`): the title's per-draw
+                    // constant blocks are carried into its ring of constants
+                    // by its own copies, not by the fills of the ring's
+                    // descriptor slots (round 4's run: no block of the shape
+                    // in 675,000 fills). The probe reads what was copied on a
+                    // thread of its own.
+                    #[cfg(feature = "diagnostics")]
+                    crate::fadeprobe::ask(src, len, 1);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
                     // What the card holds there may be another value although
@@ -8339,9 +8347,15 @@ impl HostList {
                     }
                     let started = std::time::Instant::now();
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    #[cfg(feature = "diagnostics")]
+                    crate::fadeprobe::ask(src, len, 0);
                     (started, len)
                 }
                 Step::Placed(p) => {
+                    // Diagnostic (`VICTORY_FADE_LOG`): a copy at its place in
+                    // a list reads title memory too (`crate::fadeprobe`).
+                    #[cfg(feature = "diagnostics")]
+                    crate::fadeprobe::ask(p.src, p.len, 2);
                     let started = std::time::Instant::now();
                     if crate::descriptor::in_shader_heap(p.dst, p.len) {
                         crate::port_journal::prep_wrote();
@@ -9422,12 +9436,16 @@ impl Batch {
         if self.fills.len() < FEW {
             for (dst, src, len) in self.fills.drain(..) {
                 copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                #[cfg(feature = "diagnostics")]
+                crate::fadeprobe::ask(src, len, 0);
             }
         } else {
             let fills = std::mem::take(&mut self.fills);
             crate::shadow::wide_each(fills.len().div_ceil(PART), move |i| {
                 for &(dst, src, len) in fills.iter().skip(i * PART).take(PART) {
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    #[cfg(feature = "diagnostics")]
+                    crate::fadeprobe::ask(src, len, 0);
                 }
             });
         }

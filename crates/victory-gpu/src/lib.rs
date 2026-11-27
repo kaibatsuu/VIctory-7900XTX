@@ -38,6 +38,8 @@ pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod draw;
+#[cfg(feature = "diagnostics")]
+mod fadeprobe;
 pub mod dxgi;
 #[cfg(windows)]
 pub mod external;
