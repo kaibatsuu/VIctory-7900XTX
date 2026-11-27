@@ -1079,6 +1079,7 @@ extern "system" fn present(
 #[cfg(all(windows, feature = "diagnostics"))]
 fn frame_ends() {
     crate::timeline::presented();
+    crate::framedump::presented();
     crate::faultbook::frame();
     crate::ab::presented(|switch, was, will| {
         if switch == "VICTORY_ASYNC_SUBMIT" && was && !will {
