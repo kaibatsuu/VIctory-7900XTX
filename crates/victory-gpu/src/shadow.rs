@@ -4551,6 +4551,7 @@ impl Shadow {
                     add(C::Checked, (to - from) as u64);
                     add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
                 }
+                self.fade_span(from, to);
                 return copied;
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
@@ -4562,7 +4563,24 @@ impl Shadow {
         self.copy(from, to);
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
+        self.fade_span(from, to);
         to - from
+    }
+
+    /// Diagnostic (`VICTORY_FADE_LOG=<file>`): the title's per-draw constant
+    /// block in `[from, to)`, refreshed just now, whose first float is the
+    /// alpha the props fade by (`crate::fadeprobe`). A draw's constants start
+    /// at its view's address; the few blocks after it are looked at.
+    #[cfg(feature = "diagnostics")]
+    fn fade_span(&self, from: usize, to: usize) {
+        if !crate::fadeprobe::on() {
+            return;
+        }
+        let at = from - self.start as usize;
+        let n = (to - from).min(192);
+        // SAFETY: `[from, to)` lies inside the copy, just refreshed.
+        let bytes = unsafe { std::slice::from_raw_parts(self.data.add(at), n) };
+        crate::fadeprobe::copy(from, bytes);
     }
 
     /// Diagnostic (`VICTORY_REFRESH_CHECK=1`; off by default): after a

@@ -8171,6 +8171,12 @@ impl HostList {
                     }
                     let started = std::time::Instant::now();
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        // SAFETY: our upload memory, just written with `len` bytes.
+                        let bytes = unsafe { std::slice::from_raw_parts(dst as *const u8, len) };
+                        crate::fadeprobe::copy(src, bytes);
+                    }
                     (started, len)
                 }
                 Step::Placed(p) => {
@@ -9254,12 +9260,24 @@ impl Batch {
         if self.fills.len() < FEW {
             for (dst, src, len) in self.fills.drain(..) {
                 copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                #[cfg(feature = "diagnostics")]
+                {
+                    // SAFETY: our upload memory, just written with `len` bytes.
+                    let bytes = unsafe { std::slice::from_raw_parts(dst as *const u8, len) };
+                    crate::fadeprobe::copy(src, bytes);
+                }
             }
         } else {
             let fills = std::mem::take(&mut self.fills);
             crate::shadow::wide_each(fills.len().div_ceil(PART), move |i| {
                 for &(dst, src, len) in fills.iter().skip(i * PART).take(PART) {
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        // SAFETY: as above.
+                        let bytes = unsafe { std::slice::from_raw_parts(dst as *const u8, len) };
+                        crate::fadeprobe::copy(src, bytes);
+                    }
                 }
             });
         }
