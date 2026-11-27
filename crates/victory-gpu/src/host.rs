@@ -636,6 +636,20 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
     retired().push_back((started, Retired::Resource(object)));
 }
 
+/// [`retire_resource`] for several at once: all numbered as the last of them
+/// would have been.
+pub(crate) fn retire_resources(objects: Vec<ID3D12Resource>) {
+    let queued = crate::queue::queued();
+    let started = STARTED.load(Ordering::Acquire) + queued;
+    if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
+        RETIREMENTS[0].fetch_add(objects.len() as u64, Ordering::Relaxed);
+        drop(objects);
+        return;
+    }
+    RETIREMENTS[1].fetch_add(objects.len() as u64, Ordering::Relaxed);
+    retired().extend(objects.into_iter().map(|object| (started, Retired::Resource(object))));
+}
+
 /// How many submissions later than it could (the last one that may use it
 /// has finished) an object let go is dropped, and a host list that has run
 /// is reset, about two frames: the device losses of the night of 2026-11-25
@@ -1427,6 +1441,9 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// As `epoch`, but for a texture's first use in the list, which changes
+    /// nothing for what was brought up to date before ([`HostList::moved`]).
+    moved: std::sync::atomic::AtomicU64,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -4432,6 +4449,7 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                moved: std::sync::atomic::AtomicU64::new(next_epoch()),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -6866,12 +6884,24 @@ impl HostList {
     /// buffers up to date depends on: a texture's state, a twin, what was
     /// refreshed.
     pub(crate) fn changed_something(&self) {
-        self.epoch.store(next_epoch(), Ordering::Relaxed);
+        let now = next_epoch();
+        self.epoch.store(now, Ordering::Relaxed);
+        self.moved.store(now, Ordering::Relaxed);
     }
 
     /// See [`HostList::changed_something`].
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Relaxed)
+    }
+
+    /// As [`HostList::epoch`], but the same number still after a texture's
+    /// first use in the list: that gives the list a state for a texture it
+    /// had none for, and leaves every texture, twin and range it has brought
+    /// up to date as it was. Another number when a texture the list knows
+    /// moves to another state, a twin's sides change, or the list writes
+    /// title memory; no two lists have the same.
+    pub(crate) fn moved(&self) -> u64 {
+        self.moved.load(Ordering::Relaxed)
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -6892,7 +6922,8 @@ impl HostList {
         match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert((wanted, wanted, copy));
-                self.changed_something();
+                // (A first use: `epoch` alone, see `moved`.)
+                self.epoch.store(next_epoch(), Ordering::Relaxed);
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {

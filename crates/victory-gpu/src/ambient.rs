@@ -42,6 +42,13 @@
 //! saw bright magenta on translucent surfaces). `hue`: its brightness within
 //! the same bound in the estimate's colour. `off`: the estimate alone (their
 //! default; with it a sheet of paper that glowed magenta was white).
+//!
+//! Glossy surfaces take their light from the reflections image, which the
+//! stand-in above does not touch: without rays it holds the sky's, unoccluded,
+//! and the resolve's leftovers. After `CS_UpdateHistory`,
+//! `VICTORY_AMBIENT_REFLECT=<part>` (off / `0` by default here; try `0.5`)
+//! holds it to a part of the light around (from beloooo's VIctory-Belobug-AMD
+//! `44dcd437` via zeex64/victory-7900xtx).
 
 use std::sync::{Mutex, OnceLock};
 
@@ -60,6 +67,8 @@ pub(crate) enum Role {
     /// Adds the lamps' light to what the air scatters (the last program
     /// that writes that volume before it is summed up along the view).
     Air,
+    /// Writes the reflections for the last time in a frame.
+    Reflect,
 }
 
 /// The program's part in this, by its name in the container.
@@ -71,6 +80,8 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Radiance)
     } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(Role::Air)
+    } else if has(b"CS_UpdateHistory") {
+        Some(Role::Reflect)
     } else {
         None
     }
@@ -84,6 +95,8 @@ pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
+/// Where the reflections are (R9G9B9E5 as 32-bit integers).
+pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -119,6 +132,24 @@ fn air() -> f32 {
         let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
         set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
     })
+}
+
+/// The most a reflection may hold, as a part of the light around
+/// (`VICTORY_AMBIENT_REFLECT=<part>`, unset or `0`: off, what the title has;
+/// try `0.5` for beloooo's cap).
+fn keep() -> f32 {
+    static SET: OnceLock<Option<f32>> = OnceLock::new();
+    let configured = *SET.get_or_init(|| {
+        std::env::var("VICTORY_AMBIENT_REFLECT")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|k: &f32| k.is_finite() && *k >= 0.0)
+    });
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_AMBIENT_REFLECT") {
+        return if on { configured.filter(|&k| k > 0.0).unwrap_or(0.5) } else { 0.0 };
+    }
+    configured.unwrap_or(0.0)
 }
 
 /// What `raise` does with the light the title's own resolve left
@@ -225,7 +256,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=16, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
+#define RS "RootConstants(num32BitConstants=17, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -236,6 +267,7 @@ cbuffer Set : register(b0) {
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; uint probe;
     float jump; float fresh; float dt; uint leftover;
+    float held;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -356,7 +388,7 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
 }
 #endif
 
-#ifdef RAISE
+#if defined(RAISE) || defined(HOLD)
 RWTexture2D<uint> light : register(u0);
 float3 unpack(uint v) {
     return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
@@ -370,6 +402,24 @@ uint pack(float3 c) {
     uint3 m = min(uint3(c * scale + 0.5), 511u);
     return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
 }
+#endif
+
+#ifdef HOLD
+// Reflections: no brighter than a part of the light around (as in beloooo's
+// 44dcd437).
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void hold(uint3 at : SV_DispatchThreadID) {
+    if (at.x >= width || at.y >= height) return;
+    float3 around = constant > 0.0 ? float3(1.0, 0.98, 0.94) * constant : cells[CELLS].rgb * level;
+    float3 seen_there = unpack(light[at.xy]);
+    float top = dot(around, LUMA) * held;
+    float has = dot(seen_there, LUMA);
+    if (has > top) light[at.xy] = pack(seen_there * (top / has));
+}
+#endif
+
+#ifdef RAISE
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void raise(uint3 at : SV_DispatchThreadID) {
@@ -479,6 +529,8 @@ struct Pass {
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
+    /// `None` if it did not compile: the rest goes on without it.
+    hold: Option<ID3D12PipelineState>,
     cells: ID3D12Resource,
     points: ID3D12Resource,
     stats: ID3D12Resource,
@@ -511,6 +563,9 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
+    let hold = pipeline("HOLD", s!("hold"))
+        .inspect_err(|e| tracing::warn!(error = %e, "reflections are not held to the light around"))
+        .ok();
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -520,6 +575,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         gather,
         raise,
         air,
+        hold,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
         stats: made(256)?,
@@ -586,6 +642,10 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
+    let held = if role == Role::Reflect { keep() } else { 0.0 };
+    if role == Role::Reflect && (held == 0.0 || pass.hold.is_none()) {
+        return false;
+    }
     static SAID: Mutex<u32> = Mutex::new(0);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
@@ -599,7 +659,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.stats);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 16];
+    let mut words = [0u32; 17];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -613,6 +673,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
     words[14] = (frame_ms(role) / 1000.0).to_bits();
     words[15] = leftover();
+    words[16] = held.to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -620,7 +681,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 17, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -644,6 +705,13 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                     run(&pass.gather, 20, 45, 1);
                 }
                 run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+            }
+            Role::Reflect => {
+                if let Some(hold) = &pass.hold {
+                    run(hold, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+                }
+                static HELD: std::sync::Once = std::sync::Once::new();
+                HELD.call_once(|| tracing::info!(held, "reflections held to the light around"));
             }
         }
     }
@@ -676,6 +744,7 @@ mod tests {
         assert_eq!(role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."), Some(Role::Resolve));
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
+        assert_eq!(role(b"..CS_UpdateHistory_5d0c2a11.."), Some(Role::Reflect));
         assert_eq!(role(b"CS_TemporalResolve"), None);
     }
 
@@ -685,6 +754,7 @@ mod tests {
         let Some(host) = host() else {
             return;
         };
-        make(&host.device, |bytes| host.uav_buffer(bytes)).expect("the passes");
+        let pass = make(&host.device, |bytes| host.uav_buffer(bytes)).expect("the passes");
+        assert!(pass.hold.is_some(), "the reflections' pass");
     }
 }

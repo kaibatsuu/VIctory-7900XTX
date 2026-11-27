@@ -3,7 +3,9 @@
 //! with the frame-rate line. `VICTORY_COPY_MODE=plain` copies without the
 //! mapped-page guard, `none` skips the copies (both for timing only). Set
 //! `VICTORY_MEMORY_CATEGORIES=1` for one extra periodic line that gathers the
-//! memory categories already counted here into one approximation.
+//! memory categories already counted here into one approximation, and
+//! `VICTORY_MEMLOG=<file>` to write those numbers to a CSV, one line each 5 s,
+//! so growth can be trended instead of read (`tools/memlog.ps1`).
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -572,6 +574,34 @@ mod own_tests {
     }
 }
 
+#[cfg(test)]
+mod memlog_tests {
+    use super::{memory_log_header, memory_log_line};
+
+    #[test]
+    fn the_header_names_the_fields_in_their_order() {
+        let fields = [("first_mb", 1u64), ("second", 2)];
+        assert_eq!(
+            memory_log_header(&fields),
+            "t_ms,unix_ms,frame,first_mb,second"
+        );
+    }
+
+    /// A line holds the three fixed columns and one number per field, in
+    /// the header's order.
+    #[test]
+    fn a_line_holds_every_value() {
+        let fields = [("first_mb", 1u64), ("second", 2)];
+        let line = memory_log_line(&fields);
+        let cells: Vec<&str> = line.split(',').collect();
+        assert_eq!(cells.len(), 5);
+        assert_eq!(cells[3..].to_vec(), ["1", "2"]);
+        for cell in &cells[..3] {
+            assert!(cell.parse::<u64>().is_ok(), "{cell:?} is not a number");
+        }
+    }
+}
+
 /// The process's memory in bytes: in physical memory, and committed
 /// (private bytes).
 pub(crate) fn process_memory() -> (u64, u64) {
@@ -814,6 +844,81 @@ fn log_memory_map() {
         groups.len(),
         biggest.join("; ")
     );
+}
+
+/// The header of the memory log's file ([`memory_log`]): the fixed columns,
+/// then the names of the fields, in their order.
+fn memory_log_header(fields: &[(&'static str, u64)]) -> String {
+    let names: Vec<&str> = fields.iter().map(|f| f.0).collect();
+    format!("t_ms,unix_ms,frame,{}", names.join(","))
+}
+
+/// One line of the memory log: when (milliseconds since the first frame-time
+/// sample), the wall clock, the frame, and the numbers.
+fn memory_log_line(fields: &[(&'static str, u64)]) -> String {
+    let values: Vec<String> = fields.iter().map(|f| f.1.to_string()).collect();
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    format!("{},{unix},{},{}", now_us() / 1000, crate::frame::current(), values.join(","))
+}
+
+/// Writes the numbers the memory line prints to `VICTORY_MEMLOG`'s file, one
+/// line per memory line (each 5 s), so they can be trended rather than read:
+/// a header first, then a line each ([`memory_log_header`]). Opened once, on
+/// the first line; a path that cannot be opened is said once, and the log
+/// stays off. The file is opened by the meter thread (`host::meter_lines`),
+/// the thread that makes the memory line, so the writing costs the title no
+/// thread.
+///
+/// Put the file outside this checkout: tools refuse to write game-derived
+/// output below a directory that holds `.victory-root` (docs/asset-policy.md),
+/// and a run's memory is a run's.
+fn memory_log(fields: &[(&'static str, u64)]) {
+    use std::io::Write;
+    static OUT: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    let Some(out) = OUT.get_or_init(|| open_memory_log(fields)).as_ref() else {
+        return;
+    };
+    let mut out = out.lock().unwrap_or_else(|e| e.into_inner());
+    if let Err(e) = writeln!(out, "{}", memory_log_line(fields)) {
+        tracing::warn!("VICTORY_MEMLOG: writing the memory log failed: {e}");
+    }
+}
+
+/// Opens `VICTORY_MEMLOG`'s file for [`memory_log`], with the header when the
+/// file is new, and says whether the log is on.
+fn open_memory_log(fields: &[(&'static str, u64)]) -> Option<Mutex<std::fs::File>> {
+    use std::io::Write;
+    let path = std::env::var_os("VICTORY_MEMLOG")?;
+    if path.is_empty() {
+        return None;
+    }
+    let path = std::path::PathBuf::from(path);
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!("VICTORY_MEMLOG={}: making {}: {e}", path.display(), dir.display());
+            return None;
+        }
+    }
+    let new = std::fs::metadata(&path).map(|m| m.len() == 0).unwrap_or(true);
+    let mut file = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!("VICTORY_MEMLOG={}: {e}", path.display());
+            return None;
+        }
+    };
+    if new {
+        let header = memory_log_header(fields);
+        if let Err(e) = writeln!(file, "{header}") {
+            tracing::warn!("VICTORY_MEMLOG={}: writing the header failed: {e}", path.display());
+            return None;
+        }
+        tracing::info!("memory log (VICTORY_MEMLOG): writing to {} every 5 s", path.display());
+    }
+    Some(Mutex::new(file))
 }
 
 /// Logs where the memory is: the process and the PC, then what this crate
@@ -1060,6 +1165,47 @@ fn log_memory() {
         mb(crate::shadow::window_cover()),
         lists[3],
     );
+    // The same numbers, for a log to trend rather than read: one line each
+    // 5 s, on the meter thread (`VICTORY_MEMLOG`). Counts and megabytes
+    // only; the lines above have the units and the words.
+    memory_log(&[
+        ("private_mb", private >> 20),
+        ("working_mb", working >> 20),
+        ("free_phys_mb", free >> 20),
+        ("commit_left_mb", left >> 20),
+        ("vram_local_budget_mb", card[0] >> 20),
+        ("vram_local_used_mb", card[1] >> 20),
+        ("vram_shared_budget_mb", card[2] >> 20),
+        ("vram_shared_used_mb", card[3] >> 20),
+        ("host_copies_mb", copies[1] >> 20),
+        ("window_count", copies[2]),
+        ("windows_mb", copies[3] >> 20),
+        ("snapshots_mb", copies[5] >> 20),
+        ("window_held_mb", window[4] >> 20),
+        ("staging_live_mb", staged[1] >> 20),
+        ("texture_host_mb", textures[1] >> 20),
+        ("texture_host_count", textures[0]),
+        ("title_textures_no_copy_mb", census[3] >> 20),
+        ("title_targets_mb", census[1] >> 20),
+        ("title_targets_count", targets[0]),
+        ("texture_pool_mb", pool[0]),
+        ("staging_pool_mb", pool[1]),
+        ("views_kept", views[0]),
+        ("views_free", views[1]),
+        ("views_mb", views[2] >> 20),
+        ("view_shapes", views[5]),
+        ("host_lists_alive", alive[0]),
+        ("host_lists_made", lists[0]),
+        ("preludes_made", lists[1]),
+        ("list_scratch_mb", alive[2] >> 20),
+        ("list_scratch_spare_mb", alive[4] >> 20),
+        ("list_other_uploads_mb", alive[7] >> 20),
+        ("own_alloc_mb", own[..4].iter().sum::<u64>() >> 20),
+        ("own_alloc_blocks", own[4..].iter().sum::<u64>()),
+        ("shader_containers_mb", kept[1] >> 20),
+        ("translations_mb", kept[3] >> 20),
+        ("pipeline_file_mb", kept[4] >> 20),
+    ]);
     if memory_categories() {
         let fields: &[(&str, u64)] = &[
             ("working set", working),
@@ -1189,18 +1335,27 @@ fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
 
 /// A list call on this thread that began at `started` has returned.
 pub(crate) fn recorded(started: std::time::Instant) {
+    recorded_many(started, 1);
+}
+
+/// [`recorded`] for `calls` list calls a thread made one after another from
+/// `started` on (`crate::list` `batch_begin`).
+pub(crate) fn recorded_many(started: std::time::Instant, calls: u64) {
+    if calls == 0 {
+        return;
+    }
     let took = started.elapsed();
     let ns = took.as_nanos() as u64;
     crate::timeline::called(took);
-    add(C::RecordCalls, 1);
+    add(C::RecordCalls, calls);
     add(C::RecordNs, ns);
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
         let began = now_us().saturating_sub(ns / 1000);
         add(C::UntilRecordUs, began.saturating_sub(PRESENTED_AT.load(Relaxed)));
     }
     OURS.with(|o| o.set(o.get() + ns));
-    let (unsent, calls) = UNSENT.with(|u| u.get());
-    let (unsent, calls) = (unsent + ns, calls + 1);
+    let (unsent, sent) = UNSENT.with(|u| u.get());
+    let (unsent, calls) = (unsent + ns, sent + calls);
     // By thread, a couple of milliseconds at a time.
     if unsent < 2_000_000 {
         UNSENT.with(|u| u.set((unsent, calls)));

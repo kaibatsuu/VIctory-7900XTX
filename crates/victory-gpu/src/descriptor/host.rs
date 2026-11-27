@@ -1915,6 +1915,18 @@ impl HostHeap {
         Some(self.count + first as u32)
     }
 
+    /// [`HostHeap::dynamic`] for a run a list cuts its tables from
+    /// (`crate::draw` `dynamic_chunk`): only while half of the dynamic slots
+    /// are free, and such a run may still be there. With fewer, what a list
+    /// would leave over of its last run is what another list's table needs.
+    pub(crate) fn dynamic_chunk(&self, chunk: u32) -> Option<u32> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.free.load(Relaxed) < self.dynamic / 2 || chunk >= self.too_long.load(Relaxed) {
+            return None;
+        }
+        self.dynamic(chunk)
+    }
+
     /// The title slots this heap has host slots for; fewer than the title's
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
@@ -2921,7 +2933,7 @@ impl HostHeap {
         // A running submission may still read the old resource through
         // this slot.
         if let Some(old) = old {
-            crate::host::retire_resource(old);
+            retire_kept(old);
         }
     }
 
@@ -3422,6 +3434,13 @@ impl HostHeap {
         self.made.get(index).unwrap_or(0) == 0
     }
 
+    /// The record (its words as one number) title slot `index` is made from
+    /// and stays made from until it is made again; 0: none, or not known
+    /// without the slot's lock.
+    pub(crate) fn quick_key(&self, index: u32) -> u64 {
+        self.quick.get(index as usize).map_or(0, |quick| quick.load(std::sync::atomic::Ordering::Acquire))
+    }
+
     /// Slot `index` is made from record `key` and stays so (0: not). Under
     /// the lock of `made`.
     fn quick_is(&self, index: u32, key: u64) {
@@ -3564,6 +3583,87 @@ fn staged(sampler: bool, which: u32) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
     Some(D3D12_CPU_DESCRIPTOR_HANDLE {
         ptr: stage.starts[kind] + (2 * place + which) as usize * stage.steps[kind],
     })
+}
+
+/// Whether the host resources slots let go of while a list is recorded are
+/// handed over for their burial some at a time (`VICTORY_RETIRE_BATCH=0`:
+/// one by one, as before).
+fn retire_batch() -> bool {
+    crate::toggled!("VICTORY_RETIRE_BATCH")
+}
+
+/// What this thread's slots let go of inside a [`retire_scope`], not handed
+/// over yet, and how deep in such scopes the thread is.
+struct Retiring {
+    depth: std::cell::Cell<u32>,
+    held: std::cell::RefCell<Vec<ID3D12Resource>>,
+}
+
+impl Retiring {
+    /// The most held back: more are handed over inside the scope.
+    const MOST: usize = 256;
+
+    fn hand_over(&self) {
+        let held = std::mem::take(&mut *self.held.borrow_mut());
+        if !held.is_empty() {
+            crate::host::retire_resources(held);
+        }
+    }
+}
+
+impl Drop for Retiring {
+    fn drop(&mut self) {
+        self.hand_over();
+    }
+}
+
+thread_local! {
+    static RETIRING: Retiring = const { Retiring { depth: std::cell::Cell::new(0), held: std::cell::RefCell::new(Vec::new()) } };
+}
+
+/// While it lives, what this thread's slots let go of is handed over for
+/// burial together, at the latest when the outermost one ends: no later than
+/// one by one would number it, and under the lock once ([`retire_batch`]).
+pub(crate) struct RetireScope(());
+
+/// See [`RetireScope`].
+pub(crate) fn retire_scope() -> RetireScope {
+    let _ = RETIRING.try_with(|r| r.depth.set(r.depth.get() + 1));
+    RetireScope(())
+}
+
+impl Drop for RetireScope {
+    fn drop(&mut self) {
+        let _ = RETIRING.try_with(|r| {
+            let depth = r.depth.get().saturating_sub(1);
+            r.depth.set(depth);
+            if depth == 0 && !r.held.borrow().is_empty() {
+                r.hand_over();
+            }
+        });
+    }
+}
+
+/// A slot let go of `old`, which a running submission may still read
+/// through it.
+fn retire_kept(old: ID3D12Resource) {
+    let mut old = Some(old);
+    if retire_batch() {
+        let _ = RETIRING.try_with(|r| {
+            if r.depth.get() == 0 {
+                return;
+            }
+            let mut held = r.held.borrow_mut();
+            held.extend(old.take());
+            if held.len() >= Retiring::MOST {
+                drop(held);
+                r.hand_over();
+            }
+        });
+    }
+    if let Some(old) = old {
+        crate::host::retire_resource(old);
+    }
 }
 
 /// Logs `what` the first time it happens.
