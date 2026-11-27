@@ -1483,7 +1483,7 @@ pub(crate) struct HostList {
 }
 
 /// Whether host lists' command allocators are taken anew now and then
-/// (`VICTORY_ALLOCATOR_TRIM=1`; off by default; from
+/// (on by default; `VICTORY_ALLOCATOR_TRIM=0` turns it off; from
 /// skornuta/victory-memory-stack 0013). A D3D12 command allocator never gives
 /// back the memory of the most its list ever recorded into it: a list that
 /// once took a loading frame's commands keeps that for the run (their
@@ -1496,7 +1496,7 @@ pub(crate) struct HostList {
 pub(crate) fn allocator_trim() -> Option<u64> {
     static S: OnceLock<Option<u64>> = OnceLock::new();
     *S.get_or_init(|| {
-        std::env::var_os("VICTORY_ALLOCATOR_TRIM").is_some_and(|v| v == "1").then(|| {
+        (std::env::var_os("VICTORY_ALLOCATOR_TRIM").is_none_or(|v| v != "0")).then(|| {
             std::env::var("VICTORY_ALLOCATOR_TRIM_S")
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
@@ -1543,7 +1543,7 @@ fn allocator_refresh(slot: &mut (ID3D12CommandAllocator, u64)) -> bool {
 }
 
 /// Whether host lists' indirect-work budgets share buffers
-/// (`VICTORY_BUDGET_PACK=1`; off by default; from skornuta/victory-memory-stack
+/// (on by default; `VICTORY_BUDGET_PACK=0` turns it off; from skornuta/victory-memory-stack
 /// 0023). A budget is 256 bytes of memory the CPU maps, and each list made a
 /// committed buffer of its own for it, which takes 64 KiB (602 of them held
 /// 37 MB in their first area). With the switch a budget is a 256-byte slot of
@@ -1555,7 +1555,7 @@ fn allocator_refresh(slot: &mut (ID3D12CommandAllocator, u64)) -> bool {
 /// ([`card_budget`]) stays a buffer of the list's own: barriers name it.
 fn budget_pack() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BUDGET_PACK").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUDGET_PACK").is_none_or(|v| v != "0"))
 }
 
 const BUDGET_SLOT: u64 = 256;
