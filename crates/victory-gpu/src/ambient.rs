@@ -80,11 +80,24 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Radiance)
     } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(Role::Air)
+    } else if reflect_screen() {
+        // (Whiplash) `VICTORY_REFLECT_SCREEN=1`: the hold follows the resolve of
+        // the screen-space reflections, not `CS_UpdateHistory`.
+        has(b"CS_ResolveScreenSpace_ed816b5d").then_some(Role::Reflect)
     } else if has(b"CS_UpdateHistory") {
         Some(Role::Reflect)
     } else {
         None
     }
+}
+
+/// (Whiplash) `VICTORY_REFLECT_SCREEN=1`: the reflection hold follows
+/// `CS_ResolveScreenSpace` (3 dispatches a frame in the opening house), where the
+/// title's reflections are resolved when rays find nothing, and writes its image
+/// as R11G11B10_FLOAT. Off by default: the hold follows `CS_UpdateHistory`.
+pub(crate) fn reflect_screen() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFLECT_SCREEN").is_some_and(|v| v == "1"))
 }
 
 /// Where the resolve writes the diffuse light (R9G9B9E5 as 32-bit integers)
@@ -97,6 +110,9 @@ pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 pub(crate) const AIR: (u8, u32) = (1, 32);
 /// Where the reflections are (R9G9B9E5 as 32-bit integers).
 pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
+/// (Whiplash) Where the screen-space resolve writes its reflections:
+/// R11G11B10_FLOAT, a quarter of the resolve's pixels (640x360 at 1280x720).
+pub(crate) const REFLECTIONS_SCREEN: (u8, u32) = (1, 128);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -419,6 +435,25 @@ void hold(uint3 at : SV_DispatchThreadID) {
 }
 #endif
 
+#ifdef HOLDF
+// (Whiplash) The same hold on the screen-space resolve's reflections, a typed
+// R11G11B10_FLOAT image (`VICTORY_REFLECT_SCREEN=1`); bounded by the image itself,
+// which is smaller than the views.
+RWTexture2D<float3> refl : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void hold_float(uint3 at : SV_DispatchThreadID) {
+    uint w, h;
+    refl.GetDimensions(w, h);
+    if (at.x >= w || at.y >= h) return;
+    float3 around = constant > 0.0 ? float3(1.0, 0.98, 0.94) * constant : cells[CELLS].rgb * level;
+    float3 seen_there = refl[at.xy];
+    float top = dot(around, LUMA) * held;
+    float has = dot(seen_there, LUMA);
+    if (has > top) refl[at.xy] = seen_there * (top / has);
+}
+#endif
+
 #ifdef RAISE
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
@@ -531,6 +566,8 @@ struct Pass {
     air: ID3D12PipelineState,
     /// `None` if it did not compile: the rest goes on without it.
     hold: Option<ID3D12PipelineState>,
+    /// The hold of the screen-space reflections (`VICTORY_REFLECT_SCREEN`).
+    hold_float: Option<ID3D12PipelineState>,
     cells: ID3D12Resource,
     points: ID3D12Resource,
     stats: ID3D12Resource,
@@ -566,6 +603,9 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let hold = pipeline("HOLD", s!("hold"))
         .inspect_err(|e| tracing::warn!(error = %e, "reflections are not held to the light around"))
         .ok();
+    let hold_float = pipeline("HOLDF", s!("hold_float"))
+        .inspect_err(|e| tracing::warn!(error = %e, "screen-space reflections are not held to the light around"))
+        .ok();
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -576,6 +616,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         raise,
         air,
         hold,
+        hold_float,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
         stats: made(256)?,
@@ -626,6 +667,11 @@ pub(crate) struct Views {
 /// After the title's program of that role, in `list` with the program's view
 /// heap set. Replaces the list's compute root signature and pipeline; false
 /// if it recorded nothing.
+/// The reflections' hold for the variant in use (`VICTORY_REFLECT_SCREEN`).
+fn reflect_hold(pass: &Pass) -> Option<&ID3D12PipelineState> {
+    if reflect_screen() { pass.hold_float.as_ref() } else { pass.hold.as_ref() }
+}
+
 pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     use std::sync::atomic::Ordering;
     let Some(pass) = pass() else {
@@ -643,7 +689,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         return false;
     }
     let held = if role == Role::Reflect { keep() } else { 0.0 };
-    if role == Role::Reflect && (held == 0.0 || pass.hold.is_none()) {
+    if role == Role::Reflect && (held == 0.0 || reflect_hold(pass).is_none()) {
         return false;
     }
     static SAID: Mutex<u32> = Mutex::new(0);
@@ -707,7 +753,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
             Role::Reflect => {
-                if let Some(hold) = &pass.hold {
+                if let Some(hold) = reflect_hold(pass) {
                     run(hold, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
                 }
                 static HELD: std::sync::Once = std::sync::Once::new();
@@ -756,5 +802,6 @@ mod tests {
         };
         let pass = make(&host.device, |bytes| host.uav_buffer(bytes)).expect("the passes");
         assert!(pass.hold.is_some(), "the reflections' pass");
+        assert!(pass.hold_float.is_some(), "the screen-space reflections' pass");
     }
 }
