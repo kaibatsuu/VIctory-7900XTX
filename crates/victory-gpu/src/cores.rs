@@ -239,6 +239,28 @@ fn stage() -> u32 {
     *STAGE.get_or_init(|| std::env::var("VICTORY_FAST_CORES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2))
 }
 
+/// Whether the threads a frame waits for that run on their own (the relay,
+/// the heap records' thread) run above normal priority, and the XMA decoder
+/// at the highest (`VICTORY_THREAD_PRIORITY=1`; unset: normal, as before).
+/// From victory-amd, where it is on: workers of many threads (pipelines,
+/// textures) ran ahead of them. Not yet measured here.
+fn critical_threads_raised() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_THREAD_PRIORITY").is_some_and(|v| v == "1"))
+}
+
+/// Raises the calling thread above normal priority, with
+/// [`critical_threads_raised`].
+pub(crate) fn raise_critical_thread(what: &str) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+    if !critical_threads_raised() {
+        return;
+    }
+    // SAFETY: raising the current thread's own scheduling priority.
+    let set = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) } != 0;
+    tracing::info!(what, set, "thread priority raised above normal (VICTORY_THREAD_PRIORITY=1)");
+}
+
 /// Asks the system to run the calling thread, which a frame waits for, on
 /// the fast cores only, where the processor has two kinds. That fork's submit
 /// thread was found on a slow one in 1,529 looks of 24,021. (A selection of

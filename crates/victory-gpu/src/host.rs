@@ -3757,6 +3757,7 @@ struct RelayFetch {
 /// anything a caller of [`Host::settle`] may hold: resetting the landed
 /// lists and looking at what queues hold are left to [`late_helper`].
 fn relay_worker() {
+    crate::cores::raise_critical_thread("victory-relay");
     crate::cores::keep_on_fast_cores("victory-relay");
     let Some(host) = host() else {
         return;

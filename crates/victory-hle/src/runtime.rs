@@ -277,16 +277,23 @@ pub fn use_console_timers() {
 /// virus scan) starved it, loading took 40 to 60 s instead of 28 to 33, and
 /// the opening ran without the models that were to be there (runs cpu-1,
 /// play-1125-0203). The process runs above normal, as long as it runs.
-/// `VICTORY_PROCESS_PRIORITY=normal`: as it was started.
+/// `VICTORY_PROCESS_PRIORITY=normal`: as it was started; `high`: the high
+/// class, as victory-amd has it by default (an experiment: Microsoft warns
+/// that a process of that class "can use nearly all available CPU time").
 #[cfg(windows)]
 fn ahead_of_other_programs() {
-    use windows_sys::Win32::System::Threading::{ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass};
-    if std::env::var_os("VICTORY_PROCESS_PRIORITY").is_some_and(|v| v == "normal" || v == "0") {
+    use windows_sys::Win32::System::Threading::{
+        ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, HIGH_PRIORITY_CLASS, SetPriorityClass,
+    };
+    let asked = std::env::var_os("VICTORY_PROCESS_PRIORITY");
+    if asked.as_ref().is_some_and(|v| v == "normal" || v == "0") {
         return;
     }
+    let high = asked.is_some_and(|v| v == "high");
+    let class = if high { HIGH_PRIORITY_CLASS } else { ABOVE_NORMAL_PRIORITY_CLASS };
     // SAFETY: a plain process setting.
-    let set = unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) } != 0;
-    tracing::info!(set, "the process runs above normal priority (VICTORY_PROCESS_PRIORITY=normal: not)");
+    let set = unsafe { SetPriorityClass(GetCurrentProcess(), class) } != 0;
+    tracing::info!(set, high, "the process runs above normal priority (VICTORY_PROCESS_PRIORITY=normal: not; high: the high class)");
 }
 
 #[cfg(test)]
