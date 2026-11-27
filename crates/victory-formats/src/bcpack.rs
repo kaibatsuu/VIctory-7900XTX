@@ -744,10 +744,19 @@ fn pbits(mode: u16) -> bool {
     matches!(mode, 0 | 1 | 3 | 6 | 7)
 }
 
+/// Channel rotation bits; only BC7 modes 4 and 5 have a rotation field.
+fn rotation(ctrl: u16) -> usize {
+    if matches!(ctrl & 7, 4 | 5) {
+        usize::from(ctrl >> 3 & 3)
+    } else {
+        0
+    }
+}
+
 /// Channel precisions: the p-bit is red's lowest bit; rotation swaps alpha
 /// with the rotated channel.
 fn bc7_precision(ctrl: u16) -> [u8; 4] {
-    let (mode, rot) = (ctrl & 7, usize::from(ctrl >> 3 & 3));
+    let (mode, rot) = (ctrl & 7, rotation(ctrl));
     let mut p = BC7_BITS[usize::from(mode)];
     if rot != 0 {
         p.swap(3, rot - 1);
@@ -852,7 +861,7 @@ fn bc7_pack(ep: &Bc7Ep, ix: &Bc7Ix, prec: [u8; 4], out: &mut [u8]) {
     let mode = ctrl & 7;
     let subsets = usize::from((ctrl & 0xff) >> 6);
     let part = usize::from(ctrl >> 8 & 63);
-    let rot = usize::from(ctrl >> 3 & 3);
+    let rot = rotation(ctrl);
     let mut w = Bits::default();
     w.put(1 << mode, u32::from(mode) + 1);
     match mode {
@@ -1163,6 +1172,23 @@ fn bc6<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_bc7_modes_4_and_5_rotate() {
+        for mode in 0..8u16 {
+            let ctrl = mode | 2 << 3;
+            let rotates = matches!(mode, 4 | 5);
+            assert_eq!(super::rotation(ctrl), if rotates { 2 } else { 0 }, "mode {mode}");
+            if !rotates {
+                // Bits 3-4 are no rotation here: the precisions are those
+                // of the mode alone, red's p-bit included.
+                assert_eq!(super::bc7_precision(ctrl), super::bc7_precision(mode), "mode {mode}");
+            }
+        }
+        assert_eq!(super::bc7_precision(0), [5, 4, 4, 0]);
+        // Mode 4, rotation 2: alpha and green swap.
+        assert_eq!(super::bc7_precision(4 | 2 << 3), [5, 6, 5, 5]);
+    }
+
     #[test]
     fn the_shipped_tables_parse() {
         assert!(super::Tables::builtin().is_ok());
