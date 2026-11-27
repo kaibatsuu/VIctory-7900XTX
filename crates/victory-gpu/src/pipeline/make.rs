@@ -113,6 +113,7 @@ impl Pending {
         self.made.get_or_init(|| {
             if listed_out(&self.shaders) {
                 tracing::info!(shaders = ?self.shaders, "listed in VICTORY_LEAVE_OUT: no host pipeline made");
+                super::host::note_refused(self.key.clone(), "listed in VICTORY_LEAVE_OUT");
                 return None;
             }
             let _building = crate::timeline::span("pipeline: build a host pipeline");
@@ -127,6 +128,10 @@ impl Pending {
                     tracing::warn!(
                         shaders = ?self.shaders,
                         "no host pipeline: it crashed the driver before (canary-bad.txt or warm-bad.txt); VICTORY_PIPELINE_ISOLATE=1 tests it in a child instead"
+                    );
+                    super::host::note_refused(
+                        self.key.clone(),
+                        "it crashed the driver before (canary-bad.txt or warm-bad.txt)",
                     );
                     None
                 } else if let Some((hash, mnemonic)) = fallback {
@@ -278,6 +283,15 @@ fn isolated_make(
     // A hard driver crash of this pipeline (with this fallback) was recorded
     // before: do not canary it again.
     if bad_before(key, &fallback_tag) {
+        // Silent before: such a pipeline's drops had no reason in the log.
+        tracing::debug!(
+            ?shaders,
+            "no host pipeline: it crashed the driver in a child before (canary-bad.txt)"
+        );
+        super::host::note_refused(
+            key.to_owned(),
+            "it crashed the driver in a child before (canary-bad.txt)",
+        );
         return None;
     }
     let bytes = super::known::pending(shaders, graphics);
@@ -293,6 +307,10 @@ fn isolated_make(
             tracing::warn!(
                 ?shaders,
                 "no host pipeline: the driver crashed compiling it (isolated in a child process)"
+            );
+            super::host::note_refused(
+                key.to_owned(),
+                "the driver crashed compiling it (in a child)",
             );
             None
         }
@@ -561,10 +579,14 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
                 .filter(|s| matches!(s.translated.get(), Some(None)))
                 .map(|s| format!("{} {}", s.stage, s.hash))
                 .collect();
-            Some(if failed.is_empty() {
-                format!("refused {:?}", p.shaders)
-            } else {
+            // A noted reason groups its pipelines into one line of the
+            // report (each is named at debug level when refused).
+            Some(if !failed.is_empty() {
                 failed.join(" + ")
+            } else if let Some(why) = super::host::why_refused(&p.key, &p.shaders) {
+                format!("refused: {why}")
+            } else {
+                format!("refused {:?}", p.shaders)
             })
         }
     }

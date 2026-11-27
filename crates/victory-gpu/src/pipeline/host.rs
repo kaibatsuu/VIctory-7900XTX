@@ -477,14 +477,56 @@ pub(crate) struct HostPipeline {
     pub(crate) state: String,
 }
 
-/// Logs a pipeline that gets no host pipeline, once per reason.
+/// Why pipelines got no host pipeline, by what identifies them: the shaders'
+/// listing (`{shaders:?}`) for reasons that follow from the shaders alone,
+/// the pipeline's key for those of one pipeline (a driver crash recorded for
+/// it). Read by the drop report ([`super::make::missing`]), which groups its
+/// drops by these reasons: without them every left-out pipeline was a line
+/// "refused [compute …]" of its own and the reason was logged for the first
+/// only (run baseline, 2026-11-27: 60 such lines, one reason in the log).
+static WHY_REFUSED: std::sync::Mutex<Option<std::collections::HashMap<String, &'static str>>> =
+    std::sync::Mutex::new(None);
+
+/// Notes `why` the pipeline(s) `of` names get no host pipeline.
+pub(crate) fn note_refused(of: String, why: &'static str) {
+    let mut map = WHY_REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+    map.get_or_insert_with(std::collections::HashMap::new)
+        .insert(of, why);
+}
+
+/// Why the pipeline with key `key` and shaders `shaders` got no host
+/// pipeline, if that was noted ([`note_refused`]).
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn why_refused(key: &str, shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    let map = WHY_REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.as_ref()?;
+    map.get(key)
+        .or_else(|| map.get(&format!("{shaders:?}")))
+        .copied()
+}
+
+/// Logs a pipeline that gets no host pipeline: the first of each reason as a
+/// warning, every one at debug level, and notes the reason for the drop
+/// report.
 fn refuse<T>(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<T> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !seen.contains(&reason) {
-        seen.push(reason);
-        tracing::warn!(?shaders, "no host pipeline: {reason} (logged once)");
+    let first = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let first = !seen.contains(&reason);
+        if first {
+            seen.push(reason);
+        }
+        first
+    };
+    if first {
+        tracing::warn!(
+            ?shaders,
+            "no host pipeline: {reason} (the first; each one is logged at debug level)"
+        );
+    } else {
+        tracing::debug!(?shaders, "no host pipeline: {reason}");
     }
+    note_refused(format!("{shaders:?}"), reason);
     None
 }
 
@@ -928,6 +970,7 @@ impl PreparedPipeline {
             Err(e) => {
                 tracing::warn!(error = %e, shaders = ?self.shaders, "host pipeline refused");
                 host.log_messages();
+                note_refused(format!("{:?}", self.shaders), "the driver refused it");
                 return None;
             }
         };
@@ -1490,6 +1533,18 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    /// A reason noted for one pipeline's key is found before one noted for
+    /// its shaders, and `refuse` notes its reason by the shaders. (Other
+    /// tests may note reasons for the empty shader list too, in parallel:
+    /// only that one is there is asserted, not which.)
+    #[test]
+    fn refusal_reasons_by_key_then_by_shaders() {
+        let _: Option<()> = refuse("test refusal through refuse", &[]);
+        assert!(why_refused("test-refusal-unnoted", &[]).is_some());
+        note_refused("test-refusal-key".to_owned(), "by key");
+        assert_eq!(why_refused("test-refusal-key", &[]), Some("by key"));
+    }
 
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };
