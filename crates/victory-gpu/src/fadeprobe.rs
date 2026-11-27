@@ -5,51 +5,49 @@
 //! ten faded draws differ from the solid ones in one float of their per-draw
 //! constant block, whose first twelve floats are
 //! `[alpha, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0]` with `alpha = k / 255` for a `k`
-//! the title's CPU computed (`TASK-02-findings-round2.md`, "Proven" 1). The
-//! per-frame blocks were not found in copies into the card
-//! (`crate::list`'s `fade_probe` ran and saw none): they are written by the
-//! title's CPU into title memory, and reach the card the way every other
-//! title write does. This watches the two places such bytes pass through:
+//! the title's CPU computed (`TASK-02-findings-round2.md`, "Proven" 1).
 //!
-//! - the fill of a submission's upload memory from title memory
-//!   (`crate::host`, `Step::Fill`): a constant buffer a table names, which is
-//!   how the draws' constants are given to the card (6,400-6,600 a frame,
-//!   some 480 bytes each);
-//! - the refresh of a host copy (`crate::shadow::Shadow`): a constant buffer
-//!   a root descriptor names.
+//! Nothing is scanned on the submitting thread. Round 3 read back the *upload*
+//! memory a fill went to and cost 56 ms a frame (D3D12 upload memory is
+//! write-combined: sixteen uncached reads for 48 bytes, 156,000 fills a
+//! second). Round 4's first run scanned in this process's memory on the
+//! submitting thread as well, and stood at 10 fps. Here a fill, a copy or a
+//! refresh of title memory only *names* its range ([`ask`]: a push into a list
+//! of 262,144, no lock a caller waits on, no allocation), and one thread of the
+//! probe does all the reading and all the writing to the log.
 //!
-//! Only the head of a copy is read ([`HEAD`] bytes, at every four bytes of
-//! it): a draw's constants start at its view's address, which is where a fill
-//! or a refresh of them starts. Reading whole fills cost 400+ ms a frame in
-//! the loading phase of 2026-11-27 19:26 (the clean run of the same build:
-//! 19-20 fps, copies 19-22 ms); the `C` line carries the probe's own cost so
-//! it cannot hide again.
+//! The thread takes the whole list every two milliseconds, sorts it in chunks
+//! (thousands of fills of a frame's constant ring stand next to one another),
+//! reads every run of them from title memory (through the kernel: a range the
+//! title unmapped must not fault), and looks at the ranges asked about. It is
+//! told what asked, so a `A` line says which way the bytes were travelling.
 //!
-//! Two matchers, because where the block starts is not settled:
+//! The matcher is the capture's block, `[alpha, 0, 1 × 6, …]` with `alpha` a
+//! `k / 255`:
 //!
-//! - a per-draw block by its shape, `[alpha, 0, 1 × 6]` with `alpha` a
-//!   `k / 255` in `[0, 1]`: what capture-1 showed;
-//! - any `k / 255` float strictly between 0 and 1, with the twelve floats
-//!   around it, logged once a second per distinct twelve-float shape: a value
-//!   like that is rare outside a fade (positions, scales and colours are not
-//!   n/255, though some colours are, which is why the shapes are told apart).
+//! - `A` when a block's alpha is strictly between 0 and 1, first seen or
+//!   changed (a fade step);
+//! - `A` with 0 when a block that was fading is fully hidden;
+//! - `R` when a block that faded is solid (1.0) again.
 //!
-//! Lines:
+//! Round 4's first run also had a "any `k / 255` float" discovery matcher: it
+//! wrote 866,000 lines of colour noise in a hundred seconds and starved the
+//! thread that feeds it, which cost the run its fills. It is gone.
 //!
-//! - `A <ms> <address> <bits> <alpha> <k>`: a block shaped as a per-draw
-//!   constant block whose alpha is below 1.0, first seen or changed.
-//! - `R <ms> <address> <1.0>`: such a block is solid again.
-//! - `F <ms> <address> <off in range> <bits> <alpha> <k> <12 floats hex>`: a
-//!   `k / 255` float strictly between 0 and 1, first seen at that address
-//!   with that value and in that neighbourhood.
-//! - `C <ms> <copies seen> <bytes scanned> <matched> <weak> <ns per copy
-//!   sampled>`: every five seconds.
+//! Lines (`ask` kinds: 0 fill of upload memory on the CPU, 1 buffer copy,
+//! 2 copy at its place in a list, 3 fill or copy done on the card, 4 refresh
+//! of a host copy):
 //!
-//! The `C` line carries the probe's own cost so it cannot hide again.
+//! - `A <ms> <address> <bits> <alpha> <k> <kind>`
+//! - `R <ms> <address> <1.0> <kind>`
+//! - `C <ms> <ranges> <bytes> <A and R lines> <zero-alpha blocks> <ns a range
+//!   sampled at> <ranges dropped> <µs the thread was at its work> <ranges
+//!   asked about>`: every five seconds. The probe's own cost is here so it
+//!   cannot hide again.
 //!
 //! Off unless `VICTORY_FADE_LOG` names a file; a diagnostics build only.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -57,24 +55,28 @@ use std::sync::{Mutex, OnceLock};
 /// `1.0f32`: six of a block's eight leading floats are this.
 const ONE: u32 = 0x3f80_0000;
 
-/// The bytes at the start of a copy looked at: a draw's constant block is
-/// there (alpha at 0, or at CB0[2].y, byte 36).
-const HEAD: usize = 64;
+/// The most of one asked range looked at, at every four bytes: a fill of a
+/// per-draw constant buffer is a few hundred bytes, the title's ring copies
+/// 20 KiB a frame.
+const MOST: usize = 16 << 10;
+
+/// The most ranges left for the thread (262,144 of 16 bytes, 4 MB).
+const RING: usize = 1 << 18;
 
 struct Probe {
     file: Mutex<std::io::BufWriter<std::fs::File>>,
     /// The alpha last seen at each block (title address), by bits.
     seen: Mutex<HashMap<usize, u32>>,
-    /// Blocks that showed an alpha below 1: a solid block is checked against
-    /// this with a `try_read` (a lock a fill must not wait on; the cost of
-    /// locking per fill was 3 µs a copy and 7 ms a frame at 156,000 fills a
-    /// second).
-    faded: std::sync::RwLock<std::collections::HashSet<usize>>,
-    /// Each twelve-float shape logged, and how many lines it has had.
-    shapes: Mutex<HashMap<[u32; 12], u32>>,
-    /// Copies looked at, bytes scanned, blocks matched, weak matches, the
-    /// probe's own sampled nanoseconds, and how many samples.
-    counts: [AtomicU64; 6],
+    /// Blocks that showed an alpha between 0 and 1.
+    faded: Mutex<HashSet<usize>>,
+    /// Ranges whose bytes the probe was not given ([`ask`]): title address,
+    /// length, and what asked.
+    asked: Mutex<Vec<(usize, usize, u8)>>,
+    /// Ranges looked at, bytes scanned, lines written, zero-alpha blocks, the
+    /// probe's own sampled nanoseconds, samples, ranges dropped (the list was
+    /// full or taken), microseconds the thread was at its work, and ranges
+    /// asked about.
+    counts: [AtomicU64; 14],
 }
 
 impl Probe {
@@ -82,9 +84,9 @@ impl Probe {
         Probe {
             file: Mutex::new(std::io::BufWriter::with_capacity(1 << 16, file)),
             seen: Mutex::new(HashMap::new()),
-            faded: std::sync::RwLock::new(std::collections::HashSet::new()),
-            shapes: Mutex::new(HashMap::new()),
-            counts: [const { AtomicU64::new(0) }; 6],
+            faded: Mutex::new(HashSet::new()),
+            asked: Mutex::new(Vec::with_capacity(RING)),
+            counts: [const { AtomicU64::new(0) }; 14],
         }
     }
 }
@@ -95,6 +97,7 @@ fn probe() -> Option<&'static Probe> {
         .get_or_init(|| {
             let path = std::env::var_os("VICTORY_FADE_LOG")?;
             let file = std::fs::File::create(path).ok()?;
+            start_thread();
             Some(Probe::new(file))
         })
         .as_ref()
@@ -112,118 +115,166 @@ fn now() -> u64 {
         .map_or(0, |t| t.as_millis() as u64)
 }
 
-/// What 48 bytes at some offset of a copy are.
-enum Match {
-    /// A per-draw constant block: its alpha.
-    Block(f32),
-    /// An alpha on a zero, but not the six 1.0s after it: the block's shape
-    /// is not what capture-1 showed, and the probe may be looking for the
-    /// wrong thing.
-    Weak,
-    No,
-}
-
-/// `bytes` is title memory at `title`, copied to the card just now.
-pub(crate) fn copy(title: usize, bytes: &[u8]) {
+/// A range of title memory the probe should look at, `len` bytes at `title`:
+/// `kind` is what asked (the `A` and `R` lines say it back). Nothing is read
+/// here: the thread [`start_thread`] starts does that.
+pub(crate) fn ask(title: usize, len: usize, kind: u8) {
     let Some(probe) = probe() else {
         return;
     };
-    let n = bytes.len().min(HEAD);
+    probe.counts[8].fetch_add(1, Ordering::Relaxed);
+    probe.counts[9 + (kind as usize).min(4)].fetch_add(1, Ordering::Relaxed);
+    let Ok(mut asked) = probe.asked.try_lock() else {
+        probe.counts[6].fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    if asked.len() >= RING {
+        probe.counts[6].fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    asked.push((title, len, kind));
+}
+
+/// The thread that looks at what [`ask`] left: it takes the whole list at
+/// once (a swap under the lock, so nobody waits for more than that), sorts it
+/// in chunks (the fills of a frame's constant ring stand next to one another,
+/// so a run of them is one read), reads every range from title memory through
+/// the kernel, and scans it.
+fn start_thread() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        let _ = std::thread::Builder::new()
+            .name("fade probe".into())
+            .spawn(|| {
+                /// Ranges this close are read as one run.
+                const GAP: usize = 4096;
+                /// The most of one read.
+                const RUN: usize = 64 << 10;
+                /// Ranges sorted at once (a sort of the whole list was the
+                /// thread's own cost in round 4's first run).
+                const CHUNK: usize = 2048;
+                let mut taken: Vec<(usize, usize, u8)> = Vec::with_capacity(RING);
+                let mut bytes = vec![0u8; RUN];
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    let Some(probe) = probe() else {
+                        return;
+                    };
+                    {
+                        let mut asked = probe.asked.lock().unwrap_or_else(|e| e.into_inner());
+                        if asked.is_empty() {
+                            summary(probe);
+                            continue;
+                        }
+                        std::mem::swap(&mut *asked, &mut taken);
+                    }
+                    let started = std::time::Instant::now();
+                    // A panic in here (a range that goes nowhere, a slice
+                    // that does not fit) must not take the probe down: the
+                    // rest of the list is looked at, and the `C` line's share
+                    // of lost ranges says how often one happened.
+                    let looked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        for chunk in taken.chunks_mut(CHUNK) {
+                            chunk.sort_unstable();
+                            let mut i = 0;
+                            while i < chunk.len() {
+                                let start = chunk[i].0;
+                                let mut end = (start + chunk[i].1).min(start + RUN);
+                                let mut j = i + 1;
+                                while j < chunk.len() {
+                                    let (at, len, _) = chunk[j];
+                                    let to = (at + len).min(start + RUN);
+                                    // Sorted: nothing later can reach this run.
+                                    if at > end + GAP || to <= start {
+                                        break;
+                                    }
+                                    end = end.max(to);
+                                    j += 1;
+                                }
+                                let n = (end - start).min(bytes.len());
+                                let got = if crate::host::read_into(start as *const u8, &mut bytes[..n]) {
+                                    n
+                                } else {
+                                    // A page of it went: what is left is read.
+                                    crate::host::read_there(start as *const u8, &mut bytes[..n])
+                                };
+                                if got > 0 {
+                                    for &(at, len, kind) in &chunk[i..j] {
+                                        let off = at - start;
+                                        if off >= got {
+                                            continue;
+                                        }
+                                        let len = len.min(MOST).min(got - off);
+                                        copy(probe, at, &bytes[off..off + len], kind);
+                                    }
+                                }
+                                i = j;
+                            }
+                        }
+                    }));
+                    if looked.is_err() {
+                        probe.counts[6].fetch_add(1, Ordering::Relaxed);
+                    }
+                    probe.counts[7].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    taken.clear();
+                    summary(probe);
+                    let _ = probe.file.lock().map(|mut f| f.flush());
+                }
+            });
+    });
+}
+
+/// `bytes` is title memory at `title`, whose bytes are at hand. Only the
+/// probe's thread calls this.
+fn copy(probe: &Probe, title: usize, bytes: &[u8], kind: u8) {
+    let n = bytes.len().min(MOST);
     let count = probe.counts[0].fetch_add(1, Ordering::Relaxed);
     probe.counts[1].fetch_add(n as u64, Ordering::Relaxed);
-    // The head at every four bytes: a block can start at any of them, and
-    // this is cheap once the solid blocks no longer take a lock (`faded`).
-    let mut weak = 0u64;
-    let sample = count.is_multiple_of(256);
+    let sample = count.is_multiple_of(512);
     let started = sample.then(std::time::Instant::now);
+    let mut zero = 0u64;
     let mut at = 0;
-    while at + 4 <= n {
-        let word = u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
-        if let Some(k) = byte_alpha(f32::from_bits(word)) {
-            // A colour is three or four equal components: `249/255` three
-            // times then 1.0 is everywhere in the loading phase, and taking a
-            // lock for each of 500,000 a second cost 45 ms a frame. A fade's
-            // alpha is followed by something else (0, usually).
-            let repeated = at + 8 <= n && u32::from_le_bytes([bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]]) == word;
-            if k > 0 && !repeated {
-                if let Some(floats) = floats(bytes, at) {
-                    fresh(probe, title + at, at, f32::from_bits(word), k, floats);
-                }
-            }
-        }
-        if at + 48 <= n {
-            match block(&bytes[at..at + 48]) {
-                Match::Block(alpha) => note(probe, title + at, alpha),
-                Match::Weak => weak += 1,
-                Match::No => {}
+    while at + 48 <= n {
+        let w0 = u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+        let w1 = u32::from_le_bytes([bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]]);
+        let alpha = f32::from_bits(w0);
+        // The tell that survives one moved field: an alpha, then a zero.
+        if w1 == 0 && (0.0..=1.0).contains(&alpha) && is_byte_over_255(alpha) && shape(&bytes[at..at + 48]) {
+            if alpha >= 1.0 {
+                back(probe, title + at, kind);
+            } else if alpha > 0.0 {
+                note(probe, title + at, alpha, kind);
+            } else {
+                zero += 1;
+                gone(probe, title + at, kind);
             }
         }
         at += 4;
     }
-    probe.counts[3].fetch_add(weak, Ordering::Relaxed);
+    probe.counts[3].fetch_add(zero, Ordering::Relaxed);
     if let Some(started) = started {
         probe.counts[4].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         probe.counts[5].fetch_add(1, Ordering::Relaxed);
     }
-    if count.is_multiple_of(1024) {
-        summary(probe);
-    }
 }
 
-/// `k` when `alpha` is exactly `k / 255` for a byte `k`; 0 and 255 are not a
-/// fade.
-fn byte_alpha(alpha: f32) -> Option<u32> {
-    if !(alpha > 0.0 && alpha < 1.0) {
-        return None;
-    }
-    let k = alpha * 255.0;
-    let r = k.round();
-    ((k - r).abs() <= 0.01).then_some(r as u32)
-}
-
-/// The twelve floats at `at` of `bytes`, as words, when the range holds them.
-fn floats(bytes: &[u8], at: usize) -> Option<[u32; 12]> {
-    if at + 48 > bytes.len() {
-        return None;
-    }
-    let mut out = [0u32; 12];
-    for (k, word) in out.iter_mut().enumerate() {
-        let p = at + k * 4;
-        *word = u32::from_le_bytes([bytes[p], bytes[p + 1], bytes[p + 2], bytes[p + 3]]);
-    }
-    Some(out)
-}
-
-/// What the 48 bytes `b` are: a per-draw constant block if they start
-/// `[alpha, 0, 1, 1, 1, 1, 1, 1, …]` with `alpha` a byte's worth of 255ths.
-fn block(b: &[u8]) -> Match {
-    let word = |k: usize| u32::from_le_bytes([b[k * 4], b[k * 4 + 1], b[k * 4 + 2], b[k * 4 + 3]]);
-    // The tell that survives one moved field: an alpha, then a zero.
-    if word(1) != 0 {
-        return Match::No;
-    }
-    let alpha = f32::from_bits(word(0));
+/// Whether `alpha` is a whole byte over 255 (`k / 255`, 0 and 255 included).
+fn is_byte_over_255(alpha: f32) -> bool {
     if !(0.0..=1.0).contains(&alpha) {
-        return Match::No;
+        return false;
     }
     let k = alpha * 255.0;
-    if (k - k.round()).abs() > 0.01 {
-        return Match::No;
-    }
-    if word(2) != ONE {
-        return Match::Weak;
-    }
-    for j in 3..8 {
-        if word(j) != ONE {
-            return Match::Weak;
-        }
-    }
-    Match::Block(alpha)
+    (k - k.round()).abs() <= 0.01
 }
 
-/// A `k / 255` float strictly between 0 and 1: its first sighting at an
-/// address in a given twelve-float neighbourhood.
-fn fresh(probe: &Probe, at: usize, offset: usize, alpha: f32, k: u32, floats: [u32; 12]) {
+/// Whether 48 bytes are a per-draw constant block: `[alpha, 0, 1 × 6, …]`.
+fn shape(b: &[u8]) -> bool {
+    (2..8).all(|k| u32::from_le_bytes([b[k * 4], b[k * 4 + 1], b[k * 4 + 2], b[k * 4 + 3]]) == ONE)
+}
+
+/// A per-draw block whose alpha is strictly between 0 and 1: a line when the
+/// address's alpha changed.
+fn note(probe: &Probe, at: usize, alpha: f32, kind: u8) {
     let bits = alpha.to_bits();
     let mut seen = probe.seen.lock().unwrap_or_else(|e| e.into_inner());
     if seen.len() > 1 << 20 {
@@ -233,59 +284,41 @@ fn fresh(probe: &Probe, at: usize, offset: usize, alpha: f32, k: u32, floats: [u
         return;
     }
     drop(seen);
-    // A shape gets at most a few lines: colours (249/255, 194/255) are
-    // everywhere, a fade's changing alpha is its own shape every step.
-    let mut shapes = probe.shapes.lock().unwrap_or_else(|e| e.into_inner());
-    if shapes.len() > 1 << 16 {
-        shapes.clear();
-    }
-    let n = shapes.entry(floats).or_insert(0);
-    if *n >= 8 {
-        return;
-    }
-    *n += 1;
-    drop(shapes);
-    let dwords: Vec<String> = floats.iter().map(|w| format!("{w:08x}")).collect();
-    let ms = now();
-    probe.counts[2].fetch_add(1, Ordering::Relaxed);
-    let mut file = probe.file.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = writeln!(file, "F\t{ms}\t{at:x}\t{offset}\t{bits:08x}\t{alpha:.6}\t{k}\t{}", dwords.join(","));
-}
-
-fn note(probe: &Probe, at: usize, alpha: f32) {
-    let bits = alpha.to_bits();
-    if alpha >= 1.0 {
-        // A solid block is what every draw has; only a return from a fade is
-        // worth a line. The check must not wait on a lock a fill holds (that
-        // cost 3 µs a copy): a look that misses the lock skips this block.
-        let Ok(faded) = probe.faded.try_read() else {
-            return;
-        };
-        if !faded.contains(&at) {
-            return;
-        }
-        drop(faded);
-        if let Ok(mut faded) = probe.faded.write() {
-            faded.remove(&at);
-        }
-        let mut file = probe.file.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = writeln!(file, "R\t{}\t{at:x}\t1.000000", now());
-        return;
-    }
-    let mut seen = probe.seen.lock().unwrap_or_else(|e| e.into_inner());
-    if seen.len() > 1 << 20 {
-        seen.clear();
-    }
-    if seen.insert(at, bits) == Some(bits) {
-        return;
-    }
-    drop(seen);
-    if let Ok(mut faded) = probe.faded.write() {
+    if let Ok(mut faded) = probe.faded.lock() {
         faded.insert(at);
     }
     let k = (alpha * 255.0).round() as i64;
+    line(probe, format_args!("A\t{}\t{at:x}\t{bits:08x}\t{alpha:.6}\t{k}\t{kind}", now()));
+}
+
+/// A block seen solid (1.0) again: only worth a line if it faded first.
+fn back(probe: &Probe, at: usize, kind: u8) {
+    let mut faded = probe.faded.lock().unwrap_or_else(|e| e.into_inner());
+    if !faded.remove(&at) {
+        return;
+    }
+    drop(faded);
+    line(probe, format_args!("R\t{}\t{at:x}\t1.000000\t{kind}", now()));
+}
+
+/// A block that was fading and is now 0: fully hidden. Only a block that had
+/// an alpha between 0 and 1 is worth this line (an address seen at 0 for the
+/// first time is one of the thousands of hidden entities a frame).
+fn gone(probe: &Probe, at: usize, kind: u8) {
+    let mut seen = probe.seen.lock().unwrap_or_else(|e| e.into_inner());
+    let last = seen.get(&at).copied().unwrap_or(0);
+    if last == 0 || last == ONE {
+        return;
+    }
+    seen.insert(at, 0);
+    drop(seen);
+    line(probe, format_args!("A\t{}\t{at:x}\t00000000\t0.000000\t0\t{kind}", now()));
+}
+
+fn line(probe: &Probe, fields: std::fmt::Arguments) {
+    probe.counts[2].fetch_add(1, Ordering::Relaxed);
     let mut file = probe.file.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = writeln!(file, "A\t{}\t{at:x}\t{bits:08x}\t{alpha:.6}\t{k}", now());
+    let _ = writeln!(file, "{fields}");
 }
 
 fn summary(probe: &Probe) {
@@ -301,7 +334,11 @@ fn summary(probe: &Probe) {
     let c = probe.counts.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
     let per = c[4].checked_div(c[5]).unwrap_or(0);
     let mut file = probe.file.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = writeln!(file, "C\t{ms}\t{}\t{}\t{}\t{}\t{per}", c[0], c[1], c[2], c[3]);
+    let _ = writeln!(
+        file,
+        "C\t{ms}\t{}\t{}\t{}\t{}\t{per}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        c[0], c[1], c[2], c[3], c[6], c[7], c[8], c[9], c[10], c[11], c[12], c[13]
+    );
 }
 
 #[cfg(test)]
@@ -318,23 +355,23 @@ mod tests {
 
     #[test]
     fn a_per_draw_constant_block_is_recognised() {
-        assert!(matches!(block(&block_bytes(124.0 / 255.0)), Match::Block(a) if a == 124.0 / 255.0));
-        assert!(matches!(block(&block_bytes(1.0)), Match::Block(a) if a == 1.0));
+        assert!(shape(&block_bytes(124.0 / 255.0)));
+        assert!(shape(&block_bytes(1.0)));
     }
 
     #[test]
-    fn an_alpha_on_a_zero_that_is_not_a_block_is_weak() {
+    fn an_alpha_on_a_zero_that_is_not_a_block_is_not_a_shape() {
         let mut bytes = block_bytes(124.0 / 255.0);
         bytes[8..12].copy_from_slice(&2.0f32.to_le_bytes());
-        assert!(matches!(block(&bytes), Match::Weak));
+        assert!(!shape(&bytes));
     }
 
     #[test]
     fn only_a_byte_over_255_is_a_fade_value() {
-        assert_eq!(byte_alpha(124.0 / 255.0), Some(124));
-        assert_eq!(byte_alpha(0.5), None);
-        assert_eq!(byte_alpha(1.0), None);
-        assert_eq!(byte_alpha(0.0), None);
-        assert_eq!(byte_alpha(2.0), None);
+        assert!(is_byte_over_255(124.0 / 255.0));
+        assert!(!is_byte_over_255(0.5));
+        assert!(is_byte_over_255(1.0));
+        assert!(is_byte_over_255(0.0));
+        assert!(!is_byte_over_255(2.0));
     }
 }

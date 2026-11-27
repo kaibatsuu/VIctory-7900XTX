@@ -4570,17 +4570,15 @@ impl Shadow {
     /// Diagnostic (`VICTORY_FADE_LOG=<file>`): the title's per-draw constant
     /// block in `[from, to)`, refreshed just now, whose first float is the
     /// alpha the props fade by (`crate::fadeprobe`). A draw's constants start
-    /// at its view's address; the few blocks after it are looked at.
+    /// at its view's address; the few blocks after it are asked about. The
+    /// probing thread reads them from title memory, which holds what was just
+    /// copied into this copy: nothing is read or scanned here.
     #[cfg(feature = "diagnostics")]
     fn fade_span(&self, from: usize, to: usize) {
-        if !crate::fadeprobe::on() {
-            return;
-        }
-        let at = from - self.start as usize;
         let n = (to - from).min(192);
-        // SAFETY: `[from, to)` lies inside the copy, just refreshed.
-        let bytes = unsafe { std::slice::from_raw_parts(self.data.add(at), n) };
-        crate::fadeprobe::copy(from, bytes);
+        if n > 0 {
+            crate::fadeprobe::ask(from, n, 4);
+        }
     }
 
     /// Diagnostic (`VICTORY_REFRESH_CHECK=1`; off by default): after a

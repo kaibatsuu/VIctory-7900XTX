@@ -832,6 +832,17 @@ impl Host {
             record(level == 0, &own.list.list, &own.between, &reads, &writes);
         }
         own.list.close();
+        // Diagnostic (`VICTORY_FADE_LOG`): what this did on the card, by the
+        // title address it reads (`crate::fadeprobe`). The host copy does not
+        // hold it yet (the refreshes above are done when the submission's
+        // steps run), and the upload memory it goes to is write-combined
+        // (reading it back cost 3-9 µs a fill in round 3), so the probe is
+        // given the title address to read a moment later, on a thread of its
+        // own.
+        #[cfg(feature = "diagnostics")]
+        for op in &ops {
+            crate::fadeprobe::ask(op.from.1, op.len, 3);
+        }
         // SAFETY: a live buffer.
         let gpu = unsafe { own.between.GetGPUVirtualAddress() };
         spent.next("steps on the card: the slots");
