@@ -567,6 +567,17 @@ fn window_mapped_most() -> u64 {
 /// Bytes alive of windows in card memory the CPU maps.
 static WINDOW_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Diagnostics (the panel): bytes alive of buffers of ours in the card's
+/// memory, copies' card sides and their twins and windows' card sides,
+/// in card memory the CPU maps or not.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn card_buffer_bytes() -> u64 {
+    CARD_BYTES[0].load(Ordering::Relaxed)
+        + CARD_BYTES[1].load(Ordering::Relaxed)
+        + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
+        + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed)
+}
+
 /// A buffer for a window of `size` bytes in card memory the CPU maps, if it is
 /// to be there ([`window_mapped_most`]).
 fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
