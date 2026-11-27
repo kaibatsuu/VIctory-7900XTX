@@ -4346,7 +4346,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
     crate::texback::remapped(at, len);
-    open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
+    open(&title_memory_changed(at, len), at, at.saturating_add(len));
 }
 
 /// The runtime is about to unmap title memory `[at, at + len)`: it is
@@ -5784,7 +5784,7 @@ mod tests {
         }
         assert_eq!(set.range(5..usize::MAX).next(), other.range(5..).next().copied());
         // `all` across word, multi-word, and piece boundaries, empty ranges, and holes.
-        let mut dense = Blocks::new();
+        let dense = Blocks::new();
         assert!(!dense.all(0, 0));
         assert!(!dense.all(10, 5));
         let start = Blocks::IN_PIECE - 70;

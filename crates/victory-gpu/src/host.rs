@@ -5681,10 +5681,11 @@ impl Host {
             return None;
         }
         late_threads();
-        if let Some(_) = {
+        let cut = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
             card_steps::cut_for(&runs)
-        } {
+        };
+        if cut.is_some() {
             // Not split: a cut is rare, and its parts depend on each other.
             self.execute_parts(lists, order, parts);
             return None;
@@ -6261,7 +6262,7 @@ impl Host {
                 BESIDE[3].fetch_add(took, Ordering::Relaxed);
                 BESIDE[4].fetch_add(1, Ordering::Relaxed);
                 BESIDE[8].fetch_add(waited, Ordering::Relaxed);
-                let _ = SPLIT[6].try_update(Ordering::Relaxed, Ordering::Relaxed, |ns| {
+                let _ = SPLIT[6].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |ns| {
                     Some(ns.saturating_sub(took) + waited)
                 });
             }

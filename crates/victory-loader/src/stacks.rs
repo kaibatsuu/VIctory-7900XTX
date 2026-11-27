@@ -218,7 +218,7 @@ fn sample(length: std::time::Duration, every: std::time::Duration, names: &[Stri
         std::thread::sleep(every);
     }
     let mut lines: Vec<_> = counts.into_iter().collect();
-    lines.sort_by(|a, b| b.1.cmp(&a.1));
+    lines.sort_by_key(|a| std::cmp::Reverse(a.1));
     eprintln!(
         "VIctory: {taken} samples taken, {missed} missed, {} different",
         lines.len()

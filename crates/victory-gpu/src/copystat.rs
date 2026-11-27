@@ -896,11 +896,11 @@ fn open_memory_log(fields: &[(&'static str, u64)]) -> Option<Mutex<std::fs::File
         return None;
     }
     let path = std::path::PathBuf::from(path);
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            tracing::warn!("VICTORY_MEMLOG={}: making {}: {e}", path.display(), dir.display());
-            return None;
-        }
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty())
+        && let Err(e) = std::fs::create_dir_all(dir)
+    {
+        tracing::warn!("VICTORY_MEMLOG={}: making {}: {e}", path.display(), dir.display());
+        return None;
     }
     let new = std::fs::metadata(&path).map(|m| m.len() == 0).unwrap_or(true);
     let mut file = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {

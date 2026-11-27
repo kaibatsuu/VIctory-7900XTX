@@ -736,7 +736,7 @@ impl PreparedPipeline {
         };
         // The stages' DXIL, for the library name (no copy).
         let vs_bytes: &[u8] = ordered
-            .get(0)
+            .first()
             .and_then(|(s, _)| s.translated_for(fallback))
             .map_or(&[][..], |t| &t.host.dxil[..]);
         let ps_bytes: &[u8] = ordered

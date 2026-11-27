@@ -542,10 +542,10 @@ fn fallback_for(shaders: &[Arc<Shader>]) -> Option<(String, &'static str)> {
     })
 }
 
-/// Canary children live in [`super::canary`]: a pool of persistent
-/// `victory canary-worker` processes, each making many pipelines, framed over
-/// their pipes. See that module for the pool, the watchdog and the
-/// `VICTORY_CANARY_*` switches.
+// Canary children live in [`super::canary`]: a pool of persistent
+// `victory canary-worker` processes, each making many pipelines, framed over
+// their pipes. See that module for the pool, the watchdog and the
+// `VICTORY_CANARY_*` switches.
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
 /// not translate, else "refused" or "being made"; `None` if it has one.
@@ -1044,13 +1044,13 @@ impl Queue {
                 p.queue_state.store(MAKING, Ordering::Relaxed);
                 return Some((p, TIER_EARLY));
             }
-            if self.slow_now < slow_limit {
-                if let Some(p) = unclaimed(&mut self.slow) {
-                    p.was_slow.store(true, Ordering::Relaxed);
-                    self.slow_now += 1;
-                    p.queue_state.store(MAKING, Ordering::Relaxed);
-                    return Some((p, TIER_EARLY));
-                }
+            if self.slow_now < slow_limit
+                && let Some(p) = unclaimed(&mut self.slow)
+            {
+                p.was_slow.store(true, Ordering::Relaxed);
+                self.slow_now += 1;
+                p.queue_state.store(MAKING, Ordering::Relaxed);
+                return Some((p, TIER_EARLY));
             }
         }
         None

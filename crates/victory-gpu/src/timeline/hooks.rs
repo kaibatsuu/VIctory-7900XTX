@@ -384,7 +384,7 @@ mod sleeps {
                 }
                 i = (i + 1) % THREADS.len();
             }
-            if CALLS.fetch_add(1, Relaxed) % 4096 == 0 {
+            if CALLS.fetch_add(1, Relaxed).is_multiple_of(4096) {
                 maybe_line();
             }
         } else {
