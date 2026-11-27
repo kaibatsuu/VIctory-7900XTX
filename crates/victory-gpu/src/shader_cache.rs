@@ -139,6 +139,15 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
         }
+        // Only hashed when enabled so default cache keys stay unchanged.
+        let nan_guard = victory_shader::emit::nan_guard_mode();
+        if nan_guard != 0 {
+            bytes.extend_from_slice(b"VICTORY_NAN_GUARD=");
+            bytes.push(b'0' + nan_guard);
+        }
+        if victory_shader::emit::single_latches_on() {
+            bytes.extend_from_slice(b"VICTORY_SINGLE_LATCHES=1");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();

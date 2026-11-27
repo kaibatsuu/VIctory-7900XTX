@@ -118,13 +118,30 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
+pub use lower::{host_settings, nan_guard_mode, set_host_max_wave, set_host_rdna, set_thread_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
+
+/// The stack for threads that make host pipelines from translated shaders.
+/// vkd3d-proton converts DXIL on the calling thread, recursively over its
+/// control flow: a large traversal program (the ray-tracing shadow passes)
+/// overflows the default 2 MiB, and under Wine the overflow hangs the
+/// thread instead of failing. Only reserved: pages are committed as they
+/// are used.
+pub const PIPELINE_STACK: usize = 256 << 20;
+
+/// `VICTORY_SINGLE_LATCHES=1` (off by default): merges multiple back edges
+/// of a loop header through a single latch block (`Module::single_latches`),
+/// working around vkd3d-proton's single-back-edge DXIL converter on Linux.
+/// Part of the translation: `victory-gpu`'s `shader_cache` keys on it when on.
+pub fn single_latches_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SINGLE_LATCHES").is_some_and(|v| v == "1"))
+}
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -2978,6 +2995,32 @@ mod barycentric_tests {
             v.validate(&mut shader.dxil.clone()).unwrap();
         }
         let _ = shader;
+    }
+
+    /// `VICTORY_NAN_GUARD`: a float exported to a colour target goes through
+    /// the guard when enabled (`1` or `stores`), and the program is still one
+    /// the host takes.
+    #[test]
+    fn a_colour_export_is_guarded_when_the_switch_is_on() {
+        let [e0, e1] = exp_mrt0(2);
+        // v_interp_p1_f32 v2, v0, attr0.x; exp mrt0 v2, v2, v2, v2
+        let words = [0xC808_0000, e0, e1, 0xBF81_0000];
+        let with = |mode: u8| {
+            let was = lower::TEST_NAN_GUARD.replace(Some(mode));
+            let shader = pixel(&words, PERSP_CENTER);
+            lower::TEST_NAN_GUARD.set(was);
+            shader.unwrap()
+        };
+        let (off, on, stores) = (with(0), with(1), with(2));
+        assert!(
+            on.dxil.len() > off.dxil.len(),
+            "{} against {}",
+            on.dxil.len(),
+            off.dxil.len()
+        );
+        // Typed stores as well: nothing more in a program without one.
+        assert_eq!(stores.dxil.len(), on.dxil.len());
+        validate(&on);
     }
 
     /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as
