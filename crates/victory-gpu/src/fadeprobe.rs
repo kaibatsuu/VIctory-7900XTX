@@ -46,8 +46,11 @@
 //!   draw's own constant buffer, so it names the entity as well as its alpha.
 //! - `C <ms> <ranges> <bytes> <A, R and E lines> <zero-alpha blocks> <ns a
 //!   range sampled at> <ranges dropped> <µs the thread was at its work>
-//!   <ranges asked about>`: every five seconds. The probe's own cost is here
-//!   so it cannot hide again.
+//!   <ranges asked about> <asks of each kind: fill, copy, placed, card step,
+//!   draw, refresh> <asks that still cover a block which faded>`: every five
+//!   seconds. The probe's own cost is here so it cannot hide again, and the
+//!   last number says whether the title still uploads the constant buffer of a
+//!   prop it faded out (it has stopped drawing the prop when it does not).
 //!
 //! Off unless `VICTORY_FADE_LOG` names a file; a diagnostics build only.
 
@@ -80,7 +83,7 @@ struct Probe {
     /// probe's own sampled nanoseconds, samples, ranges dropped (the list was
     /// full or taken), microseconds the thread was at its work, and ranges
     /// asked about.
-    counts: [AtomicU64; 14],
+    counts: [AtomicU64; 16],
 }
 
 impl Probe {
@@ -90,7 +93,7 @@ impl Probe {
             seen: Mutex::new(HashMap::new()),
             faded: Mutex::new(HashSet::new()),
             asked: Mutex::new(Vec::with_capacity(RING)),
-            counts: [const { AtomicU64::new(0) }; 14],
+            counts: [const { AtomicU64::new(0) }; 16],
         }
     }
 }
@@ -127,7 +130,18 @@ pub(crate) fn ask(title: usize, len: usize, kind: u8) {
         return;
     };
     probe.counts[8].fetch_add(1, Ordering::Relaxed);
-    probe.counts[9 + (kind as usize).min(4)].fetch_add(1, Ordering::Relaxed);
+    probe.counts[9 + (kind as usize).min(5)].fetch_add(1, Ordering::Relaxed);
+    // Whether a range that holds a block which faded is still asked about: if
+    // it is not, the title no longer uploads that constant buffer, so the prop
+    // it names is not drawn any more (`C`'s next to last number).
+    if let Ok(faded) = probe.faded.lock()
+        && !faded.is_empty()
+        && faded
+            .iter()
+            .any(|&at| at >= title && at < title.saturating_add(len.max(1)))
+    {
+        probe.counts[15].fetch_add(1, Ordering::Relaxed);
+    }
     let Ok(mut asked) = probe.asked.try_lock() else {
         probe.counts[6].fetch_add(1, Ordering::Relaxed);
         return;
@@ -400,8 +414,8 @@ fn summary(probe: &Probe) {
     let mut file = probe.file.lock().unwrap_or_else(|e| e.into_inner());
     let _ = writeln!(
         file,
-        "C\t{ms}\t{}\t{}\t{}\t{}\t{per}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-        c[0], c[1], c[2], c[3], c[6], c[7], c[8], c[9], c[10], c[11], c[12], c[13]
+        "C\t{ms}\t{}\t{}\t{}\t{}\t{per}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        c[0], c[1], c[2], c[3], c[6], c[7], c[8], c[9], c[10], c[11], c[12], c[13], c[14], c[15]
     );
 }
 
