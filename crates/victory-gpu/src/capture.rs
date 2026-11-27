@@ -47,7 +47,30 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named
+        || n == GRAB.load(std::sync::atomic::Ordering::Relaxed)
+        || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+}
+
+/// The frame F9 asked for (with a capture folder): saved and listed like
+/// those of `VICTORY_CAPTURE_FRAMES`, to find the draws of what is seen.
+static GRAB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// At the present of `frame`: F9 just pressed asks for the frame after
+/// next (the next one may be recording already).
+#[cfg(windows)]
+fn poll_grab(frame: u64) {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F9};
+    static WAS: AtomicBool = AtomicBool::new(false);
+    // SAFETY: a plain key state query.
+    let down = unsafe { GetAsyncKeyState(i32::from(VK_F9)) } < 0;
+    if !down {
+        WAS.store(false, Relaxed);
+    } else if !WAS.swap(true, Relaxed) && folder().is_some() {
+        GRAB.store(frame + 2, Relaxed);
+        tracing::info!(frame = frame + 2, "F9: this frame is captured (picture, render targets, ops list)");
+    }
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -128,6 +151,8 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
+    #[cfg(windows)]
+    poll_grab(frame);
     if world_on()
         && drawn.saturating_sub(before) >= 500
         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
