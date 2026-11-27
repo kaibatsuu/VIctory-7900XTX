@@ -118,7 +118,7 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     let host = crate::host::host()?;
     match place_in(&host.device, start, len) {
         Ok(placed) => {
-            crate::inplace::counted(window, len);
+            crate::inplace::counted(window, start, len);
             let n = STATS[2].fetch_add(1, Ordering::Relaxed) + 1;
             if n <= 32 || n.is_power_of_two() {
                 tracing::info!(
