@@ -1828,6 +1828,15 @@ impl State {
                         }
                         continue;
                     };
+                    // Diagnostic (`VICTORY_FADE_LOG`): the draw's own constant
+                    // buffers, for the per-entity alpha the alpha-clip and
+                    // foliage pixel shaders stipple by (`crate::fadeprobe`
+                    // reads `CB0[2].y` of them on a thread of its own: nothing
+                    // is read here).
+                    #[cfg(feature = "diagnostics")]
+                    if !compute && !srv {
+                        crate::fadeprobe::ask(address as usize, 64, 5);
+                    }
                     // The shader adds the bytes a raw view begins early by.
                     let biased = srv
                         && t.host.user_data.iter().any(|u| {

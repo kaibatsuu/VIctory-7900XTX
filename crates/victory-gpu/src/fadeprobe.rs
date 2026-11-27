@@ -36,14 +36,18 @@
 //!
 //! Lines (`ask` kinds: 0 fill of upload memory on the CPU, 1 buffer copy,
 //! 2 copy at its place in a list, 3 fill or copy done on the card, 4 refresh
-//! of a host copy):
+//! of a host copy, 5 a graphics draw's own constant buffer):
 //!
 //! - `A <ms> <address> <bits> <alpha> <k> <kind>`
 //! - `R <ms> <address> <1.0> <kind>`
-//! - `C <ms> <ranges> <bytes> <A and R lines> <zero-alpha blocks> <ns a range
-//!   sampled at> <ranges dropped> <µs the thread was at its work> <ranges
-//!   asked about>`: every five seconds. The probe's own cost is here so it
-//!   cannot hide again.
+//! - `E <ms> <address> <bits> <alpha> <k> <kind>`: `CB0[2].y` of a graphics
+//!   draw's constant buffer (kind 5), a `k / 255` between 0 and 1, changed;
+//!   `1.0` when a field that was fading is solid again. The address is the
+//!   draw's own constant buffer, so it names the entity as well as its alpha.
+//! - `C <ms> <ranges> <bytes> <A, R and E lines> <zero-alpha blocks> <ns a
+//!   range sampled at> <ranges dropped> <µs the thread was at its work>
+//!   <ranges asked about>`: every five seconds. The probe's own cost is here
+//!   so it cannot hide again.
 //!
 //! Off unless `VICTORY_FADE_LOG` names a file; a diagnostics build only.
 
@@ -128,6 +132,11 @@ pub(crate) fn ask(title: usize, len: usize, kind: u8) {
         probe.counts[6].fetch_add(1, Ordering::Relaxed);
         return;
     };
+    // Draws of one instance stand one after the other with one constant
+    // buffer: the same range again is nothing new.
+    if asked.last().is_some_and(|&(t, l, k)| t == title && l == len && k == kind) {
+        return;
+    }
     if asked.len() >= RING {
         probe.counts[6].fetch_add(1, Ordering::Relaxed);
         return;
@@ -251,6 +260,20 @@ fn copy(probe: &Probe, title: usize, bytes: &[u8], kind: u8) {
         }
         at += 4;
     }
+    // A graphics draw's constant buffer (kind 5): the field the alpha-clip and
+    // foliage pixel shaders read, `CB0[2].y`, is the ninth float of the block
+    // (`PS_DeferredTextured_AlphaClip`, round 1). A constant buffer whose
+    // ninth float is a whole byte over 255 is no accident: matrix and scale
+    // floats are not n/255.
+    if kind == 5 && n >= 40 {
+        let bits = u32::from_le_bytes([bytes[36], bytes[37], bytes[38], bytes[39]]);
+        let alpha = f32::from_bits(bits);
+        match byte_alpha(alpha) {
+            Some(k) => field(probe, title + 36, alpha, k, kind),
+            None if alpha >= 1.0 => field_back(probe, title + 36, kind),
+            None => {}
+        }
+    }
     probe.counts[3].fetch_add(zero, Ordering::Relaxed);
     if let Some(started) = started {
         probe.counts[4].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -270,6 +293,47 @@ fn is_byte_over_255(alpha: f32) -> bool {
 /// Whether 48 bytes are a per-draw constant block: `[alpha, 0, 1 × 6, …]`.
 fn shape(b: &[u8]) -> bool {
     (2..8).all(|k| u32::from_le_bytes([b[k * 4], b[k * 4 + 1], b[k * 4 + 2], b[k * 4 + 3]]) == ONE)
+}
+
+/// `k` when `alpha` is exactly `k / 255` for a byte `k` strictly between 0 and
+/// 255: a fade value.
+fn byte_alpha(alpha: f32) -> Option<u32> {
+    if !(alpha > 0.0 && alpha < 1.0) || !is_byte_over_255(alpha) {
+        return None;
+    }
+    Some((alpha * 255.0).round() as u32)
+}
+
+/// A draw's constant buffer: `CB0[2].y` (the ninth float), an alpha between 0
+/// and 1, logged when it changes. The address is the draw's own constant
+/// buffer, so it names the entity as well as its alpha.
+fn field(probe: &Probe, at: usize, alpha: f32, k: u32, kind: u8) {
+    let bits = alpha.to_bits();
+    let mut seen = probe.seen.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() > 1 << 20 {
+        seen.clear();
+    }
+    if seen.insert(at, bits) == Some(bits) {
+        return;
+    }
+    drop(seen);
+    let ms = now();
+    line(probe, format_args!("E\t{ms}\t{at:x}\t{bits:08x}\t{alpha:.6}\t{k}\t{kind}"));
+}
+
+/// The same field solid again: only worth a line if it was fading.
+fn field_back(probe: &Probe, at: usize, kind: u8) {
+    let mut seen = probe.seen.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(bits) = seen.get(&at).copied() else {
+        return;
+    };
+    if byte_alpha(f32::from_bits(bits)).is_none() {
+        return;
+    }
+    seen.remove(&at);
+    drop(seen);
+    let ms = now();
+    line(probe, format_args!("E\t{ms}\t{at:x}\t3f800000\t1.000000\t255\t{kind}"));
 }
 
 /// A per-draw block whose alpha is strictly between 0 and 1: a line when the
