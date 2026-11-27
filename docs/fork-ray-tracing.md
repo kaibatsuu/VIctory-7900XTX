@@ -160,6 +160,8 @@ fork's constant.
 | `VICTORY_AMBIENT_SHADE=<strength>,<metres>` | the creases (1,0.6) |
 | `VICTORY_AMBIENT_AIR=<multiple>` | what the air scatters is bounded by a multiple of the light around (off: the brown veil in the day room stays with it, light-14) |
 | `VICTORY_AMBIENT_REFLECT=<part>` | caps glossy reflections (`CS_UpdateHistory`) to a share of the light around (off / `0` by default here; try `0.5`) |
+| `VICTORY_AMBIENT_BOOST=<multiple>` | the most the light from one side raises a point over the light around (2.5 by default here, as before; try `1.25`). Indoors and at night the stand-in reads back its own light the frame after; at level 0.8, on a white wall, past about 1.5 it feeds on itself and rooms pulse between too bright and too dark |
+| `VICTORY_AMBIENT_CELLS=<ms>` | each cell's light followed over the last frames before it is gathered (off / `0` by default here; try `120`); a jump of the light around is taken at once |
 
 It is off while the builder runs.
 
