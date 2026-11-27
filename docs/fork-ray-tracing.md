@@ -159,6 +159,7 @@ fork's constant.
 | `VICTORY_AMBIENT=constant:<level>` | the same light everywhere |
 | `VICTORY_AMBIENT_SHADE=<strength>,<metres>` | the creases (1,0.6) |
 | `VICTORY_AMBIENT_AIR=<multiple>` | what the air scatters is bounded by a multiple of the light around (off: the brown veil in the day room stays with it, light-14) |
+| `VICTORY_AMBIENT_REFLECT=<part>` | caps glossy reflections (`CS_UpdateHistory`) to a share of the light around (off / `0` by default here; try `0.5`) |
 
 It is off while the builder runs.
 

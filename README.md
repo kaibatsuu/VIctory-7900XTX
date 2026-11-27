@@ -71,6 +71,32 @@ No run of this branch was made: the defaults are the picture every figure here
 was measured with, and each line in the table is an experiment with what to look
 at recorded in the doc.
 
+### Ported from zeex64/victory-7900xtx (2026-11-27)
+
+Audited on 2026-11-27: [zeex64/victory-7900xtx](https://github.com/zeex64/victory-7900xtx)
+at `e2b05f4` (8 commits past our shared ancestor `b0cfe2b`). Applicable
+improvements were ported across recording/submission parallelism, write-watch
+fast paths and safety fixes, pipeline/pool/resource caches, crash diagnostics,
+and optional shader/ambient switches; what was ported, adapted, or skipped is
+in [docs/ports-2026-11-27-zeex64.md](docs/ports-2026-11-27-zeex64.md).
+
+- **Recording & submission fast paths (on by default, each switchable `=0`)**:
+  `VICTORY_ASK_BESIDE`, `VICTORY_REFRESH_BESIDE`, `VICTORY_SNAPSHOTS_BESIDE`
+  (`VICTORY_BESIDE_SPIN`), `VICTORY_GAPS_TOGETHER`, `VICTORY_DYNAMIC_CHUNK`,
+  `VICTORY_READY_FINE`, `VICTORY_ENTRY_READY`, `VICTORY_TARGETS_ONCE`,
+  `VICTORY_RETIRE_BATCH`, `VICTORY_RECORD_BATCH`, `VICTORY_PLACED_QUICK`,
+  `VICTORY_FRESH_QUICK`, `VICTORY_UPLOAD_ASKED`, `VICTORY_ASK_KNOWN`,
+  `VICTORY_REMAP_LEAN`, `VICTORY_SWEEP_FOLLOWS_ROOM`,
+  `VICTORY_SWEEP_GONE_FIRST`, `VICTORY_LIFT_SELDOM`, `VICTORY_UNMAP_RUNS`.
+- **Opt-in / Wine-default switches (off by default on Windows)**:
+  `VICTORY_AMBIENT_REFLECT=0.5`, `VICTORY_NAN_GUARD=1|stores`,
+  `VICTORY_SINGLE_LATCHES=1`, `VICTORY_CARD_FINE=1`, `VICTORY_WIDE_MORE=1`,
+  `VICTORY_TAKE_FINE=1`, `VICTORY_POOLS_MORE=1`, `VICTORY_LEAVE_OUT=<hash>`,
+  `VICTORY_LARGE_STACK=1`, `VICTORY_GUARD_HOT_FRAMES=4`,
+  `VICTORY_HOLES_TOLD=1`, `VICTORY_TEXTURE_ASK_ONCE=1`, `VICTORY_MAP_SAME=1`,
+  `VICTORY_NO_WATCHDOG=1`, `VICTORY_SKIP_BINK=1|all`,
+  `VICTORY_SKIP_INTRO=<sec>`, `VICTORY_SAMPLE=<ms>`.
+
 ## How to run it
 
 You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader model
