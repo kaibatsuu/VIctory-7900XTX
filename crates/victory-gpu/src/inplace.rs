@@ -152,6 +152,7 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             let at = if window { 0 } else { 2 };
             STATS[at].fetch_add(1, Ordering::Relaxed);
             STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+            pin(start, len, true);
             Some(placed)
         }
         Err(None) => {
@@ -175,11 +176,60 @@ pub(crate) fn counted(window: bool, bytes: u64) {
     STATS[at + 1].fetch_add(bytes, Ordering::Relaxed);
 }
 
-/// What [`place_for`] gave is gone.
-pub(crate) fn gone(window: bool, bytes: u64) {
+/// What [`place_for`] gave (title memory `[start, start + bytes)`) is gone.
+pub(crate) fn gone(window: bool, start: u64, bytes: u64) {
     let at = if window { 0 } else { 2 };
     STATS[at].fetch_sub(1, Ordering::Relaxed);
     STATS[at + 1].fetch_sub(bytes, Ordering::Relaxed);
+    if level() > 0 {
+        pin(start, bytes, false);
+    }
+}
+
+/// The 64 KiB blocks of title memory that heaps opened in place hold, and
+/// how many heaps hold each.
+static PINNED: std::sync::Mutex<BTreeMap<u64, u32>> = std::sync::Mutex::new(BTreeMap::new());
+
+/// Notes the blocks of `[start, start + bytes)` held (or let go) by one
+/// more heap in place.
+fn pin(start: u64, bytes: u64, held: bool) {
+    let (first, last) = (
+        start / K64 as u64,
+        (start + bytes.max(1)).div_ceil(K64 as u64),
+    );
+    let mut pinned = PINNED.lock().unwrap_or_else(|e| e.into_inner());
+    for block in first..last {
+        if held {
+            *pinned.entry(block).or_insert(0) += 1;
+        } else if let std::collections::btree_map::Entry::Occupied(mut e) = pinned.entry(block) {
+            *e.get_mut() -= 1;
+            if *e.get() == 0 {
+                e.remove();
+            }
+        }
+    }
+}
+
+/// Whether a heap opened in place holds a page of title memory
+/// `[start, end)` (`VICTORY_INPLACE` is not 0).
+///
+/// Such memory must not be asked about with a reset of its write watch: under
+/// Wine the reset write-protects the range's pages, triggering MMU notifiers
+/// that unpin the card's userptr heaps and stall on GPU completion.
+pub(crate) fn pinned(start: usize, end: usize) -> bool {
+    if level() == 0 {
+        return false;
+    }
+    let (first, last) = ((start / K64) as u64, end.div_ceil(K64) as u64);
+    if first >= last {
+        return false;
+    }
+    PINNED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .range(first..last)
+        .next()
+        .is_some()
 }
 
 /// Title memory `[at, at + len)` is about to show something else, or the

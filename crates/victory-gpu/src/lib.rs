@@ -159,7 +159,7 @@ pub fn set_lazy_commit_hook(f: fn(usize) -> bool) {
 }
 #[cfg(windows)]
 pub use watch::{
-    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
-    title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
-    writing as kernel_will_write,
+    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_placeholder,
+    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_splitting,
+    title_memory_unmapping, title_memory_written, writing as kernel_will_write,
 };

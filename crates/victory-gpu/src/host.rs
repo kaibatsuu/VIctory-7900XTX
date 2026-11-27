@@ -8681,6 +8681,9 @@ impl Batch {
     fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
         let started = std::time::Instant::now();
         let _one = crate::timeline::span("a copy's refresh");
+        // (A block the title keeps writing is left open for buffer refreshes:
+        // `crate::watch::hot_frames`.)
+        let _hot = crate::watch::hot_asker();
         let copied = shadow.update(from, to - from);
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
@@ -9216,6 +9219,21 @@ pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
         });
     }
     got
+}
+
+/// Whether we run under Wine (its ntdll exports `wine_get_version`): what
+/// costs little on Windows can be a request to wineserver there, whose one
+/// thread serves every thread of the process.
+pub(crate) fn on_wine() -> bool {
+    static WINE: OnceLock<bool> = OnceLock::new();
+    *WINE.get_or_init(|| {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: plain lookups in ntdll, always loaded.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        }
+    })
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
