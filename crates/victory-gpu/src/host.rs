@@ -10000,6 +10000,14 @@ impl Meter {
                          (VICTORY_EXACT_NO_WAIT=0: all wait)"
                     );
                 }
+                let [checked, skipped] =
+                    [0, 1].map(|i| crate::texture::STAGED_CHECKS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                if checked + skipped > 0.0 {
+                    tracing::info!(
+                        "texture pass checks per frame (VICTORY_STAGED_ONLY_TITLE): {checked:.1} asked whether all of a texture \
+                         is there, {skipped:.1} not asked (not at a title address)"
+                    );
+                }
                 let busy = crate::texture::LEFT_BUSY.swap(0, Ordering::Relaxed) as f64 / frames;
                 if busy > 0.0 {
                     tracing::info!(

@@ -437,6 +437,11 @@ pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 4] = [const { std::sy
 /// was not there).
 pub(crate) static EXACT_UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Diagnostics: the texture pass's staged checks since the last frame line,
+/// `[asked, not asked]`: whether all of a texture is there, and the checks
+/// `VICTORY_STAGED_ONLY_TITLE` leaves out (a texture not at a title address).
+pub(crate) static STAGED_CHECKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Whether an exact refresh (the uploads before a bake, `BAKING`) that
 /// finds the runtime remapping title memory first reads the texture whole
 /// through the kernel, and waits for the remapping to end only if a page of
@@ -450,7 +455,23 @@ pub(crate) static EXACT_UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { s
 /// with `VICTORY_TEXTURE_NO_WAIT=1`, where only exact refreshes wait).
 fn exact_unlocked() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_EXACT_NO_WAIT").is_some_and(|v| v == "1"))
+    let env = *ON.get_or_init(|| std::env::var_os("VICTORY_EXACT_NO_WAIT").is_some_and(|v| v == "1"));
+    switched("VICTORY_EXACT_NO_WAIT").unwrap_or(env)
+}
+
+/// Diagnostics: whether `switch` is on in the phase of a `VICTORY_AB` run
+/// under way (`ab`), if it is one of those; `None` otherwise, and in every
+/// build without diagnostics.
+fn switched(switch: &str) -> Option<bool> {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    {
+        crate::ab::pick(switch)
+    }
+    #[cfg(not(all(windows, feature = "diagnostics")))]
+    {
+        let _ = switch;
+        None
+    }
 }
 
 /// Since the last frame-rate line, of texture refreshes on every thread, in
@@ -1859,9 +1880,15 @@ pub(crate) fn staged(resource: This, ask: bool) -> Option<(u64, bool)> {
         let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
         map.as_ref()?.get(&(resource as usize))?.clone()
     };
-    let ask = ask
-        && (!*ONLY_TITLE.get_or_init(|| std::env::var_os("VICTORY_STAGED_ONLY_TITLE").is_some_and(|v| v == "1"))
-            || crate::resource::at_title_address(resource));
+    let only_title = *ONLY_TITLE.get_or_init(|| std::env::var_os("VICTORY_STAGED_ONLY_TITLE").is_some_and(|v| v == "1"));
+    let only_title = switched("VICTORY_STAGED_ONLY_TITLE").unwrap_or(only_title);
+    let ask = if ask {
+        let check = !only_title || crate::resource::at_title_address(resource);
+        STAGED_CHECKS[usize::from(!check)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        check
+    } else {
+        false
+    };
     Some((s.read as u64, !ask || committed(s.memory, s.read)))
 }
 
