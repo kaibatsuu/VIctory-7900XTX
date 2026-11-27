@@ -267,7 +267,12 @@ impl HostList {
                     };
                     unsafe {
                         self.list.CopyBufferRegion(&between, 0, &from.buffer, offset, len as u64);
-                        self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                        // The host copy was promoted to a copy's source: back
+                        // to common, to be promoted to its destination.
+                        self.list.ResourceBarrier(&[
+                            transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                            transition(&from.buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+                        ]);
                         wait_for_all(host, &self.list);
                         self.list.CopyBufferRegion(&to.buffer, at, &between, 0, len as u64);
                     }
@@ -281,7 +286,15 @@ impl HostList {
             },
             (None, None) => return false,
         }
-        unsafe { wait_for_all(host, &self.list) };
+        // The destination was promoted to a copy's destination, a write
+        // state: no use after it in the list (the draws' root views read it,
+        // issue #350) could promote it again. Back to common, as the
+        // submission's lists expect the host copies.
+        // SAFETY: an open list; a live buffer.
+        unsafe {
+            self.list.ResourceBarrier(&[transition(&to.buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
+            wait_for_all(host, &self.list);
+        }
         STATS[0].fetch_add(1, Ordering::Relaxed);
         STATS[1].fetch_add(len as u64, Ordering::Relaxed);
         to.gpu_writes(self, dst as u64, len as u64);
