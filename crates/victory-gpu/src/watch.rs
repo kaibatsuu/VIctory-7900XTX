@@ -1086,7 +1086,6 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// about too, where it does not hold them (a list of ours that joined the
 /// submission after the asking was made, `crate::host`'s `ask_beside`). What
 /// was asked before stays as it was asked.
-#[allow(dead_code)]
 pub(crate) fn ask_more(ranges: &[(usize, usize)]) {
     if !once() || ranges.is_empty() {
         return;
@@ -2109,14 +2108,12 @@ fn ask_known() -> bool {
 
 /// Whether a submission's one asking ([`ask_once`]) also includes textures
 /// in write-watched memory (`VICTORY_TEXTURE_ASK_ONCE`; on under Wine).
-#[allow(dead_code)]
 pub(crate) fn texture_ask_once() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     wine_switch("VICTORY_TEXTURE_ASK_ONCE", &ON) && once()
 }
 
 /// Whether an asking about `[start, end)` would go to the kernel.
-#[allow(dead_code)]
 pub(crate) fn kernel_asked(start: usize, end: usize) -> bool {
     start < end
         && !PROTECTED.any(start / BLOCK, end.div_ceil(BLOCK))

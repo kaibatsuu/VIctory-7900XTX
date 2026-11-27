@@ -101,6 +101,9 @@ fn retired() -> std::sync::MutexGuard<'static, std::collections::VecDeque<(u64, 
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Times flights were landed: counted when a landing is over, under the
+/// line's lock, where the line says what is still in the air.
+static LANDINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A retired object, dropped on whatever thread finishes the submission.
 #[allow(dead_code)]
@@ -3306,6 +3309,65 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     }
 }
 
+/// What a submission's one write-watch asking is about
+/// (`crate::watch::ask_once`): per host copy (by address) the span of the
+/// ranges `runs` refresh of it, where the copy is asked ahead; and the
+/// ranges, which are those spans and the textures refreshed, where the kernel
+/// would be asked for each (`crate::watch::texture_ask_once`).
+fn asked_ranges(runs: &[&HostList]) -> (Vec<(usize, usize)>, ByCopy<(usize, usize)>) {
+    let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
+    let with_textures = crate::watch::texture_ask_once();
+    let mut textures: Vec<(usize, usize)> = Vec::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::Refresh(shadow, address, len) = step
+                && shadow.asked_ahead()
+            {
+                let span = spans
+                    .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                    .or_insert((*address, *address + *len));
+                *span = (span.0.min(*address), span.1.max(*address + *len));
+            } else if with_textures
+                && let Step::Texture(upload) = step
+                && let Some((from, to)) = upload.staging.asked()
+                && crate::watch::kernel_asked(from, to)
+            {
+                textures.push((from, to));
+            }
+        }
+    }
+    let mut ranges: Vec<(usize, usize)> = spans.values().copied().collect();
+    textures.sort_unstable();
+    textures.dedup();
+    ranges.extend(textures);
+    (ranges, spans)
+}
+
+/// Whether the write watch is asked for a submission sent ahead by a thread
+/// beside the one that prepares it ([`beside`]), while that plans the steps
+/// done on the card ([`card_steps`]) (`VICTORY_ASK_BESIDE=0`: behind the
+/// planning, by the submitting thread, as before).
+fn ask_beside() -> bool {
+    crate::toggled!("VICTORY_ASK_BESIDE")
+}
+
+/// Whether the refreshes ahead of a submission's steps ([`refresh_front`],
+/// [`ahead_of_writes`]) are done by the thread beside the submitting one
+/// while that puts the title's bytes under flights' writes
+/// ([`stale_under_flights`]) (`VICTORY_REFRESH_BESIDE=0`: behind that, as
+/// before).
+fn refresh_beside() -> bool {
+    crate::toggled!("VICTORY_REFRESH_BESIDE")
+}
+
+/// Whether a submission's snapshots (`crate::shadow::take_snapshots`) are
+/// taken by the thread beside the submitting one while that sees to the
+/// copies in the card's memory ([`Host::card_before`])
+/// (`VICTORY_SNAPSHOTS_BESIDE=0`: in front of that, as before).
+fn snapshots_beside() -> bool {
+    crate::toggled!("VICTORY_SNAPSHOTS_BESIDE")
+}
+
 /// Since the last frame-rate line, ns of [`stale_under_flights`] looking
 /// through the lists' refreshes for copies shaders may be writing.
 static UNDER_SCAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3985,6 +4047,7 @@ fn late_line(frames: f64) {
 
 pub(crate) mod aside;
 pub(crate) mod awake;
+mod beside;
 mod card_steps;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
@@ -4732,7 +4795,10 @@ impl Host {
                         // pieces and flags those whose hash is another.
                         list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        let joins = rehash_runs() || own.is_some();
+                        // (With `crate::shadow::card_fine` a piece holds
+                        // several of the runs sent up: joined there too,
+                        // each piece hashed whole and once.)
+                        let joins = rehash_runs() || own.is_some() || crate::shadow::card_fine();
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
                         } else {
@@ -5350,6 +5416,7 @@ impl Host {
             }
             join_ranges(written, ranges);
             *settling = false;
+            LANDINGS.fetch_add(1, Ordering::SeqCst);
             // The landed lists are reset, and what queues hold looked at,
             // by the helper thread (they take locks a waiter may hold).
             *poke = true;
@@ -5879,7 +5946,10 @@ impl Host {
                 FINISHED.store(last, Ordering::Release);
                 bury(last);
             }
-            line().landed.extend(landed);
+            let mut line = line();
+            line.landed.extend(landed);
+            LANDINGS.fetch_add(1, Ordering::SeqCst);
+            drop(line);
         }
         if counted {
             self.log_messages();
@@ -5951,6 +6021,26 @@ impl Host {
         let ahead = Split::begin();
         #[cfg(feature = "diagnostics")]
         SPLIT[11].fetch_add(called.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        let _spreads = Spreads(crate::shadow::wide_waited());
+        // The write watch is asked about what the title's lists refresh while
+        // the steps for the card are planned ([`ask_beside`]).
+        let landings = LANDINGS.load(Ordering::SeqCst);
+        let mut waited_for_flights = false;
+        let asking = (late && crate::watch::once() && ask_beside()).then(|| {
+            // SAFETY: ended below, or dropped where this returns; the work
+            // reads the lists' steps under their locks, as the thread that
+            // lands flights reads those of lists in the air, and asks the
+            // write watch as any thread of the title's may.
+            unsafe {
+                beside::begin(move || {
+                    let began = std::time::Instant::now();
+                    let (ranges, spans) = asked_ranges(runs);
+                    crate::watch::ask_once(&ranges);
+                    (ranges, spans, began.elapsed())
+                })
+            }
+        });
         stage.next("submit: steps given to the card");
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
@@ -5965,6 +6055,7 @@ impl Host {
         } else if own.is_none()
             && let Some(why) = late_blocked(runs)
         {
+            waited_for_flights = true;
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
@@ -6012,6 +6103,7 @@ impl Host {
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
+            waited_for_flights = true;
             self.settle(&mut submitted, WHY_SYNC);
             if upcheck::on() {
                 upcheck::at_rest(self);
@@ -6045,27 +6137,57 @@ impl Host {
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
+        // The refreshes ahead of the steps, begun beside what follows the
+        // asking ([`refresh_beside`]); and as many declared ranges as were
+        // done with before they were begun.
+        let mut refreshing = None;
+        let mut done_with = [0; 2];
+        let mut stale_settled = false;
+        let refresh_beside = refresh_beside();
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
-            let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
-            for list in runs {
-                for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && shadow.asked_ahead()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
-                    }
-                }
-            }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            // Asked beside the planning: that asking stands, if nothing was
+            // landed since before it was begun. What a list of ours for the
+            // card refreshes ([`card_steps`]) is asked about now, where the
+            // asking does not hold it.
+            let stands = !waited_for_flights && LANDINGS.load(Ordering::SeqCst) == landings;
             #[cfg(feature = "diagnostics")]
-            SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
-            stage.next("submit: asking the write watch");
-            crate::watch::ask_once(&ranges);
+            if asking.is_some() {
+                BESIDE[1].fetch_add(1, Ordering::Relaxed);
+                BESIDE[2].fetch_add(u64::from(!stands), Ordering::Relaxed);
+            }
+            // (One that does not stand is let go: not made, if it was not
+            // begun.)
+            let ranges = match asking.filter(|_| stands) {
+                Some(asking) => {
+                    stage.next("submit: asking the write watch");
+                    let (mut ranges, spans, _took) = asking.end();
+                    #[cfg(feature = "diagnostics")]
+                    BESIDE[0].fetch_add(_took.as_nanos() as u64, Ordering::Relaxed);
+                    if let Some(own) = &own {
+                        let mut more: Vec<(usize, usize)> = Vec::new();
+                        for (copy, (from, to)) in asked_ranges(&[own.list()]).1 {
+                            match spans.get(&copy) {
+                                Some(&(a, b)) if a <= from && to <= b => {}
+                                Some(&(a, b)) => more.push((a.min(from), b.max(to))),
+                                None => more.push((from, to)),
+                            }
+                        }
+                        crate::watch::ask_more(&more);
+                        ranges.extend(more);
+                    }
+                    ranges
+                }
+                None => {
+                    let (ranges, _) = asked_ranges(runs);
+                    #[cfg(feature = "diagnostics")]
+                    SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
+                    stage.next("submit: asking the write watch");
+                    crate::watch::ask_once(&ranges);
+                    ranges
+                }
+            };
             #[cfg(feature = "diagnostics")]
             split.part(0);
             stage.next("submit: title bytes under flights' writes");
@@ -6079,8 +6201,37 @@ impl Host {
                     upcheck::reads(runs);
                 }
             }
+            if behind && refresh_beside && (refresh_front() || ahead_of_writes()) {
+                done_with[0] = crate::shadow::ranges_done_with()[1];
+                let (batch, parts, own) = (&mut batch, &parts[..], own.as_ref());
+                // SAFETY: ended below, before the batch, the lists or the
+                // list of ours are touched again by this thread, which
+                // meanwhile reads the lists' steps under their locks; the
+                // work is the refreshes as this thread does them, each copy
+                // behind its own locks.
+                refreshing = Some(unsafe {
+                    beside::begin(move || {
+                        let began = std::time::Instant::now();
+                        batch.ahead_of_steps(runs, parts, own);
+                        began.elapsed()
+                    })
+                });
+            }
             let stale = if behind { stale_under_flights(runs) } else { Vec::new() };
+            // (Those begun by now: a range that leaves its copy from here on
+            // was found declared where the title's bytes went under it.)
+            done_with[1] = crate::shadow::ranges_done_with()[0];
             if !stale.is_empty() {
+                // What is refreshed is refreshed again behind the flights.
+                if let Some(refreshing) = refreshing.take() {
+                    let _took = refreshing.end();
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        BESIDE[3].fetch_add(_took.as_nanos() as u64, Ordering::Relaxed);
+                        BESIDE[4].fetch_add(1, Ordering::Relaxed);
+                    }
+                    stale_settled = true;
+                }
                 let settling = std::time::Instant::now();
                 self.settle_stale(&mut submitted, runs, stale, &ranges);
                 settled += settling.elapsed();
@@ -6095,10 +6246,38 @@ impl Host {
         // What flights in the air may write.
         let air = line().written.clone();
         stage.next("submit: refreshes ahead of writes");
-        if refresh_front() {
-            batch.refresh_front(runs, &parts);
-        } else if ahead_of_writes() {
-            batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
+        // (Moved out of its place: it borrows the batch while it is there.)
+        let beside_done = { refreshing }.map(|refreshing| {
+            #[cfg(feature = "diagnostics")]
+            let ending = std::time::Instant::now();
+            let _took = refreshing.end();
+            #[cfg(feature = "diagnostics")]
+            {
+                // (The refreshes' term is this thread's time.)
+                let (took, waited) = (_took.as_nanos() as u64, ending.elapsed().as_nanos() as u64);
+                BESIDE[3].fetch_add(took, Ordering::Relaxed);
+                BESIDE[4].fetch_add(1, Ordering::Relaxed);
+                BESIDE[8].fetch_add(waited, Ordering::Relaxed);
+                let _ = SPLIT[6].try_update(Ordering::Relaxed, Ordering::Relaxed, |ns| {
+                    Some(ns.saturating_sub(took) + waited)
+                });
+            }
+        });
+        // Done beside: once more only if a declared range left its copy
+        // meanwhile. The refreshes found it declared and left it alone, and
+        // what puts the title's bytes under flights' writes found it gone:
+        // now it is gone for both. So too behind a wait for flights.
+        let again = match beside_done {
+            Some(()) => (done_with[1] != done_with[0]).then_some(false),
+            None => stale_settled.then_some(true),
+        };
+        if let Some(textures) = again {
+            #[cfg(feature = "diagnostics")]
+            BESIDE[5].fetch_add(1, Ordering::Relaxed);
+            batch.again(textures);
+        }
+        if beside_done.is_none() || again.is_some() {
+            batch.ahead_of_steps(runs, &parts, own.as_ref());
         }
         stage.next("submit: the lists' steps");
         // What this submission will signal: a staging buffer its preludes
@@ -6136,7 +6315,26 @@ impl Host {
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
-        {
+        let flown = late && relay();
+        let low = flown && self.card_results_low();
+        // Beside what follows for the copies in the card's memory
+        // ([`snapshots_beside`]), unless flights are landed first.
+        let snapping = (snapshots_beside() && !low)
+            .then(crate::shadow::noted_snapshots)
+            .filter(|snaps| !snaps.is_empty())
+            .map(|snaps| {
+                // SAFETY: ended below, before the lists go to the card and
+                // before anything else is put into a snapshot; the work is
+                // `crate::shadow::take_snapshots`'s, of what was noted till here.
+                unsafe {
+                    beside::begin(move || {
+                        let began = std::time::Instant::now();
+                        crate::shadow::take_noted(snaps);
+                        began.elapsed()
+                    })
+                }
+            });
+        if snapping.is_none() {
             #[cfg(feature = "diagnostics")]
             let snapshots = std::time::Instant::now();
             crate::shadow::take_snapshots();
@@ -6149,8 +6347,7 @@ impl Host {
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
-        let flown = late && relay();
-        if flown && self.card_results_low() {
+        if low {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
@@ -6163,6 +6360,22 @@ impl Host {
         }
         let declared = declared_writes(runs);
         let card = self.card_before(&declared, &picked, flown);
+        if let Some(snapping) = snapping {
+            #[cfg(feature = "diagnostics")]
+            let ending = std::time::Instant::now();
+            let _took = snapping.end();
+            #[cfg(feature = "diagnostics")]
+            {
+                // (The snapshots' term is this thread's time.)
+                let waited = ending.elapsed();
+                BESIDE[6].fetch_add(_took.as_nanos() as u64, Ordering::Relaxed);
+                BESIDE[7].fetch_add(1, Ordering::Relaxed);
+                BESIDE[8].fetch_add(waited.as_nanos() as u64, Ordering::Relaxed);
+                SPLIT[3].fetch_add(waited.as_nanos() as u64, Ordering::Relaxed);
+                split.skip(waited);
+                crate::copystat::add(crate::copystat::C::SnapshotUs, _took.as_micros() as u64);
+            }
+        }
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
         for (shadow, at, bytes) in batch.placed.drain(..) {
@@ -7914,8 +8127,9 @@ impl HostList {
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
                     // What the card holds there may be another value although
-                    // ours did not change.
-                    if send::own() {
+                    // ours did not change. (So too where a refresh sends
+                    // only what changed on the CPU's side.)
+                    if send::own() || crate::shadow::card_fine() {
                         crate::shadow::send_copied(dst, len);
                     }
                     (started, len)
@@ -8115,6 +8329,36 @@ impl Split {
         let now = std::time::Instant::now();
         SPLIT[i].fetch_add((now - self.0.replace(now)).as_nanos() as u64, Ordering::Relaxed);
     }
+
+    /// `counted` of what came since the last part is counted already.
+    fn skip(&self, counted: std::time::Duration) {
+        self.0.set(self.0.get() + counted);
+    }
+}
+
+/// Since the last frame-rate line, of what a thread beside the submitting one
+/// does ([`beside`]): nanoseconds of asking the write watch, the submissions
+/// it was asked for so, those asked again by the submitting thread; of the
+/// refreshes ahead of the steps nanoseconds, times, times done again; of the
+/// snapshots nanoseconds, times; nanoseconds the submitting thread was at
+/// the ends of the last two (waiting, or doing what was not begun). Then, of
+/// the submitting thread's work spread over threads (`crate::shadow::wide`):
+/// how often, and the nanoseconds it stood until the others were done.
+#[cfg(feature = "diagnostics")]
+static BESIDE: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+
+/// Counts a submission's spreads into [`BESIDE`] when it is over: what
+/// `crate::shadow::wide_waited` said when it began.
+#[cfg(feature = "diagnostics")]
+struct Spreads([u64; 2]);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for Spreads {
+    fn drop(&mut self) {
+        let now = crate::shadow::wide_waited();
+        BESIDE[9].fetch_add(now[0].saturating_sub(self.0[0]), Ordering::Relaxed);
+        BESIDE[10].fetch_add(now[1].saturating_sub(self.0[1]), Ordering::Relaxed);
+    }
 }
 
 /// The split of the preparing, per frame, for the frame-rate line.
@@ -8126,13 +8370,20 @@ fn split_line(frames: f64) {
     let a: Vec<f64> = crate::watch::asks().iter().map(|&n| n as f64 / frames).collect();
     let h: Vec<f64> = crate::draw::HEAP_SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
     let s: Vec<f64> = crate::shadow::send_stats().iter().map(|&n| n as f64 / frames).collect();
+    let b: Vec<f64> = BESIDE.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let k: Vec<f64> = beside::COUNTS.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "preparing per frame, the submitting thread: {:.1} ms asking the write watch ({:.1} of them finding what to ask), {:.1} putting the title's bytes under flights' \
          writes, {:.1} in the lists' steps (refreshes {:.1} in {:.0} flushes of {:.0}, {:.0} of them known to copy nothing, {:.0} on \
          several threads, {:.1} one at a time in {:.0} before shader writes; copies and fills {:.1}, the refreshes before copies among them), {:.1} snapshots, {:.1} for copies in the \
          card's memory, {:.1} sending the lists (VICTORY_LIGHT_REFRESH is {}); ahead of these {:.1} waiting for the submission lock, {:.1} \
          planning steps done on the card, {:.1} waiting for flights, {:.1} the heaps' records and what is swept; at the end {:.1} waiting \
-         for the heaps' records; asked early by a thread of its own {:.0} pieces of 2 MiB, {:.1} ms (VICTORY_ASK_EARLY)",
+         for the heaps' records; asked early by a thread of its own {:.0} pieces of 2 MiB, {:.1} ms (VICTORY_ASK_EARLY); by a thread \
+         beside it, not in the terms before: {:.1} ms asking the write watch for {:.1} submissions, {:.1} of them asked again behind \
+         a landing (VICTORY_ASK_BESIDE), {:.1} ms of refreshes ahead of the steps for {:.1}, {:.1} done again \
+         (VICTORY_REFRESH_BESIDE), {:.1} ms of snapshots for {:.1} (VICTORY_SNAPSHOTS_BESIDE); that thread began {:.1} of its {:.1} \
+         pieces of work itself, and the submitting thread was {:.1} ms at the ends of the last two kinds; it stood {:.1} ms at the \
+         ends of {:.0} spreads of its work over threads",
         ms[0],
         ms[8],
         ms[1],
@@ -8156,6 +8407,19 @@ fn split_line(frames: f64) {
         ms[15],
         e[0],
         e[1] / 1e3,
+        b[0] / 1e6,
+        b[1],
+        b[2],
+        b[3] / 1e6,
+        b[4],
+        b[5],
+        b[6] / 1e6,
+        b[7],
+        k[1],
+        k[0],
+        b[8] / 1e6,
+        b[10] / 1e6,
+        b[9],
     );
     tracing::info!(
         "asking about title memory per frame, all threads: {:.0} kernel askings over {:.0} MB ({:.1} ms, {:.0} pages of 4 KiB found \
@@ -8660,6 +8924,27 @@ fn wide_textures() -> bool {
 }
 
 impl Batch {
+    /// The refreshes in front of the steps of `runs`, if there are any
+    /// ([`refresh_front`], [`ahead_of_writes`]). `own`: the list of ours
+    /// whose copies and fills are done on the card.
+    fn ahead_of_steps(&mut self, runs: &[&HostList], parts: &[usize], own: Option<&card_steps::Taken>) {
+        if refresh_front() {
+            self.refresh_front(runs, parts);
+        } else if ahead_of_writes() {
+            self.refresh_ahead(runs, |list, i| own.is_some_and(|own| own.takes(list, i)));
+        }
+    }
+
+    /// Before [`Batch::ahead_of_steps`] is done once more: nothing counts as
+    /// refreshed ahead, and with `textures` no texture as looked at.
+    fn again(&mut self, textures: bool) {
+        self.ahead.clear();
+        self.front = false;
+        if textures {
+            self.textures.clear();
+        }
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
@@ -9667,6 +9952,18 @@ impl Meter {
                         "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
                          ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
                         if rehash_runs() { "on" } else { "off" }
+                    );
+                }
+            }
+            {
+                let [pages, same, whole, runs, noted, compared] = crate::shadow::fine_stats().map(|n| n as f64 / frames);
+                if pages > 0.0 {
+                    tracing::info!(
+                        "pages taken again into copies in the card's memory per frame (VICTORY_CARD_FINE=1: compare and send changed runs): \
+                         {pages:.0} parts of pages compared ({:.1} MB), {same:.0} found identical, {whole:.0} sent whole, {runs:.0} runs \
+                         sent of the others; {:.2} MB noted for the card",
+                        compared / 1e6,
+                        noted / 1e6
                     );
                 }
             }
@@ -11447,6 +11744,11 @@ mod refresh_tests {
         if std::env::var_os("VICTORY_SEND_CHANGED").is_some_and(|v| v != "0") {
             assert_eq!(again, []);
             assert_eq!(written, [(2 * PAGE + 128, 2 * PAGE + 132), (2 * PAGE + 136, 2 * PAGE + 144)]);
+        } else if crate::shadow::card_fine() {
+            // The 256 bytes that hold what changed, and nothing of a page
+            // that holds what it held.
+            assert_eq!(again, []);
+            assert_eq!(written, [(2 * PAGE, 2 * PAGE + 256)]);
         } else {
             assert_eq!(again, [(PAGE, 2 * PAGE)]);
             assert_eq!(written, [(2 * PAGE, 3 * PAGE)]);

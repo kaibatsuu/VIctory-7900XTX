@@ -1282,7 +1282,6 @@ impl Staging {
 
     /// The title memory a refresh asks the write watch about, if it asks:
     /// not a texture that is read once.
-    #[allow(dead_code)]
     pub(crate) fn asked(&self) -> Option<(usize, usize)> {
         (!self.once.load(std::sync::atomic::Ordering::Relaxed) && self.read != 0)
             .then(|| (self.memory as usize, self.memory as usize + self.read))

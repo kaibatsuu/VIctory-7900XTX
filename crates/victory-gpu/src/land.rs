@@ -199,6 +199,8 @@ pub(crate) fn log(frames: f64) {
 struct Pool {
     state: Mutex<State>,
     more: Condvar,
+    /// Where the second half of the helpers waits ([`more`]).
+    spare: Condvar,
     idle: Condvar,
     /// One batch at a time.
     turn: Mutex<()>,
@@ -231,11 +233,20 @@ impl Pool {
         let pool: &'static Pool = Box::leak(Box::new(Pool {
             state: Mutex::new(State { work: None, next: 0, count: 0, running: 0, panicked: false }),
             more: Condvar::new(),
+            spare: Condvar::new(),
             idle: Condvar::new(),
             turn: Mutex::new(()),
             threads,
         }));
-        for i in 1..threads {
+        // As many helpers again, spawned only when `VICTORY_POOLS_MORE` is on
+        // or named in `VICTORY_AB`: they wait at a word of their own so one
+        // that is not to help takes no wake-up from one that is.
+        #[cfg(feature = "diagnostics")]
+        let want_spares = more() || crate::ab::pick("VICTORY_POOLS_MORE").is_some();
+        #[cfg(not(feature = "diagnostics"))]
+        let want_spares = more();
+        let total = if want_spares { (threads * 2).min(16) } else { threads };
+        for i in 1..total {
             // (A helper that is not there is only missed.)
             let _ = std::thread::Builder::new().name(format!("{name}-{i}")).spawn(move || {
                 if name == "victory-land" {
@@ -243,17 +254,22 @@ impl Pool {
                 } else {
                     crate::cores::keep_many_on_fast_cores(name);
                 }
-                pool.help()
+                pool.help(i >= threads)
             });
         }
         pool
     }
 
-    fn help(&self) {
+    fn help(&self, spare: bool) {
         let mut state = self.state();
         loop {
+            if spare && !more() {
+                state = self.spare.wait(state).unwrap_or_else(|e| e.into_inner());
+                continue;
+            }
             let Some((work, i)) = take(&mut state) else {
-                state = self.more.wait(state).unwrap_or_else(|e| e.into_inner());
+                let word = if spare { &self.spare } else { &self.more };
+                state = word.wait(state).unwrap_or_else(|e| e.into_inner());
                 continue;
             };
             state.running += 1;
@@ -288,6 +304,9 @@ impl Pool {
         drop(state);
         if count > self.threads {
             self.more.notify_all();
+            if more() {
+                self.spare.notify_all();
+            }
         } else {
             (1..count).for_each(|_| self.more.notify_one());
         }
@@ -320,6 +339,17 @@ fn take(state: &mut State) -> Option<(Work, usize)> {
     }
     state.next += 1;
     Some((work, state.next - 1))
+}
+
+/// Whether a pool's second half of helpers takes work
+/// (`VICTORY_POOLS_MORE=1`; off by default).
+fn more() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_POOLS_MORE") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOLS_MORE").is_some_and(|v| v == "1"))
 }
 
 /// [`Pool::each`] on the threads kept for landing.
