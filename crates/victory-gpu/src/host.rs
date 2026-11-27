@@ -250,6 +250,25 @@ pub(crate) fn not_resident() -> D3D12_HEAP_FLAGS {
     if wait_resident() { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE }
 }
 
+/// Whether the short-lived buffers of [`Host::upload_buffer`],
+/// [`Host::shared_buffer`] and [`Host::uav_buffer`] skip the [`resident`] and
+/// [`mapped`] waits: made resident at once, as before those waits
+/// (`VICTORY_BUFFER_NO_WAIT=1`; unset: waited for like all new memory).
+/// victory-amd found the waits ~25 s of a five-minute session (70,000
+/// buffers) and holds that these buffers are named only by lists recorded
+/// after they are made. Not shown here for host copies, which descriptor
+/// slots of lists already sent may name (the device losses of 2026-11-25,
+/// [`wait_resident`]): an experiment.
+fn buffer_no_wait() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUFFER_NO_WAIT").is_some_and(|v| v == "1"))
+}
+
+/// The heap flag of [`buffer_no_wait`]'s buffers.
+fn buffer_flags() -> D3D12_HEAP_FLAGS {
+    if buffer_no_wait() { D3D12_HEAP_FLAG_NONE } else { not_resident() }
+}
+
 /// A queue of its own that new memory is waited for with ([`mapped`]).
 struct Aside {
     queue: ID3D12CommandQueue,
@@ -9735,7 +9754,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    buffer_flags(),
                     &desc,
                     D3D12_RESOURCE_STATE_GENERIC_READ,
                     None,
@@ -9743,7 +9762,9 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
+                    if !buffer_no_wait() {
+                        resident(&self.device, b)?;
+                    }
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -10766,7 +10787,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    buffer_flags(),
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -10774,8 +10795,10 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    mapped(&self.device)?;
+                    if !buffer_no_wait() {
+                        resident(&self.device, b)?;
+                        mapped(&self.device)?;
+                    }
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -10897,7 +10920,7 @@ impl Host {
         let made = unsafe {
             self.device.CreateCommittedResource(
                 &heap,
-                not_resident(),
+                buffer_flags(),
                 &desc,
                 D3D12_RESOURCE_STATE_COMMON,
                 None,
@@ -10908,7 +10931,11 @@ impl Host {
         if let Some(b) = &buffer {
             crate::book::made(b, || "an unordered access buffer".into());
         }
-        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
+        let made = if buffer_no_wait() {
+            made
+        } else {
+            made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device))
+        };
         match made {
             Ok(()) => buffer,
             Err(e) => {
