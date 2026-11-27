@@ -1084,6 +1084,9 @@ fn frame_ends() {
         if switch == "VICTORY_ASYNC_SUBMIT" && was && !will {
             behind::leave();
         }
+        if switch == "VICTORY_SUBMIT_SPLIT" {
+            behind::split_turning_off(was, will);
+        }
     });
     if let Some(on) = crate::ab::pick("VICTORY_LANE_CORE") {
         static WAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

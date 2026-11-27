@@ -641,6 +641,12 @@ impl Work for Job {
     }
 
     fn go(self, forced: bool) {
+        // The split turned off while the title runs (`VICTORY_AB`): nothing is
+        // handed over from here on, and what already was is settled before this
+        // thread settles anything itself, so the title is told in one order.
+        if !split() && SETTLE_FIRST.swap(false, Relaxed) {
+            SETTLED.drain();
+        }
         let began = Instant::now();
         let _doing = crate::timeline::span(match self {
             Job::Run(..) => "the line: a submission",
@@ -831,18 +837,67 @@ fn number(name: &str) -> Option<usize> {
 /// row (`VICTORY_SUBMIT_SPLIT=1`; with `VICTORY_ASYNC_SUBMIT`): one prepares
 /// and sends each submission, the other waits for what was sent and settles
 /// it. Off (the default): the one thread does both, as before. Set by
-/// [`started`] once the thread that settles is up.
+/// [`started`] once the thread that settles is up; when the switch is one
+/// `VICTORY_AB` changes, [`split`] also follows the phase under way.
 static SPLIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The number of `VICTORY_SUBMIT_SPLIT` among `VICTORY_AB`'s switches, read
+/// once; `None`: the switch does not change while the title runs.
+#[cfg(feature = "diagnostics")]
+static SPLIT_AB: OnceLock<Option<u32>> = OnceLock::new();
+
+/// Whether the threads are two (`SPLIT`) and the phase under way has the
+/// switch on. With the switch one `VICTORY_AB` changes, one run measures both:
+/// its phases' frame times are logged apart (`crate::ab`).
 fn split() -> bool {
-    SPLIT.load(Relaxed)
+    split_with(SPLIT.load(Relaxed), split_phase())
 }
 
-/// Whether the split was asked for (`VICTORY_SUBMIT_SPLIT=1`).
+/// [`split`] from whether the thread that settles is up and the phase under
+/// way, when the switch is one `VICTORY_AB` changes.
+fn split_with(thread_up: bool, phase: Option<bool>) -> bool {
+    thread_up && phase.unwrap_or(true)
+}
+
+/// The phase under way, when `VICTORY_SUBMIT_SPLIT` is one `VICTORY_AB`
+/// changes; `None`: its own variable decided, once, at start.
+#[cfg(feature = "diagnostics")]
+fn split_phase() -> Option<bool> {
+    let bit = *SPLIT_AB.get_or_init(|| crate::ab::bit("VICTORY_SUBMIT_SPLIT"));
+    bit.map(crate::ab::on)
+}
+
+#[cfg(not(feature = "diagnostics"))]
+fn split_phase() -> Option<bool> {
+    None
+}
+
+/// Whether the split was asked for: `VICTORY_SUBMIT_SPLIT=1`, or named in
+/// `VICTORY_AB`, which changes it while the title runs (the thread that
+/// settles is started for the whole run then, and [`split`] says whether it is
+/// given anything in the phase under way).
 fn wants_split() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SUBMIT_SPLIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SUBMIT_SPLIT").is_some_and(|v| v == "1") || split_named())
 }
+
+/// Whether `VICTORY_SUBMIT_SPLIT` is one of the switches `VICTORY_AB` changes.
+#[cfg(feature = "diagnostics")]
+fn split_named() -> bool {
+    crate::ab::bit("VICTORY_SUBMIT_SPLIT").is_some()
+}
+
+#[cfg(not(feature = "diagnostics"))]
+fn split_named() -> bool {
+    false
+}
+
+/// Set when the split goes from on to off while the title runs (`VICTORY_AB`):
+/// what the preparing thread already handed over is settled before it settles
+/// anything by itself, so the title is still told in one order (a fence's
+/// value is stored as given, so a later value set before an earlier one would
+/// take the earlier one's place).
+static SETTLE_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 thread_local! {
     /// This is the thread that does what is in the line.
@@ -870,6 +925,23 @@ pub(super) fn on() -> bool {
 pub(super) fn leave() {
     LANE.wait_presents(0);
     LANE.drain();
+    if split() {
+        // What the preparing thread handed over is settled too: after this the
+        // line is not given anything, and nothing else would settle it.
+        SETTLED.drain();
+    }
+}
+
+/// `VICTORY_SUBMIT_SPLIT` goes from on to off while the title runs
+/// (`VICTORY_AB`): from the next submission on, the preparing thread settles
+/// its own work, and it waits for what it handed over first ([`SETTLE_FIRST`]).
+/// Turning it on needs nothing: the thread that settles is up for the whole
+/// run and takes what it is given.
+#[cfg(feature = "diagnostics")]
+pub(super) fn split_turning_off(was: bool, will: bool) {
+    if was && !will && split() {
+        SETTLE_FIRST.store(true, Relaxed);
+    }
 }
 
 /// Starts the thread, once: whether there is one.
@@ -1120,6 +1192,16 @@ mod tests {
     use std::sync::Arc;
 
     type Log = Arc<Mutex<Vec<String>>>;
+
+    /// The split is on only with the thread that settles up and the phase
+    /// under way (`VICTORY_AB`) on; without a phase, the variable decided.
+    #[test]
+    fn the_split_needs_its_thread_and_its_phase() {
+        assert!(!split_with(false, None));
+        assert!(split_with(true, None));
+        assert!(split_with(true, Some(true)));
+        assert!(!split_with(true, Some(false)));
+    }
 
     /// A job of a test: what it stands at, and what it does.
     enum T {
