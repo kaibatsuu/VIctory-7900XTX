@@ -477,9 +477,7 @@ enum Ask {
 /// The fence signals a submission was given behind: set once it has run.
 fn do_signals(signals: Vec<(usize, u64)>) {
     for (fence, value) in signals {
-        if !crate::host::late_signal(fence, value) {
-            crate::fence::set(fence as This, value);
-        }
+        late_or_now(fence, value);
     }
 }
 
@@ -712,11 +710,7 @@ impl Work for Job {
                 // (A part that had no list is one all the same.)
                 QUEUED.fetch_sub(1 + parts.len() as u64, Relaxed);
             }
-            Job::Signal(fence, value) => {
-                if !crate::host::late_signal(fence, value) {
-                    crate::fence::set(fence as This, value);
-                }
-            }
+            Job::Signal(fence, value) => late_or_now(fence, value),
             Job::Present(texture, overlay, shown) => {
                 if let Some((texture, state)) = texture {
                     // (Where its lists were not translated when the title
@@ -1060,11 +1054,17 @@ fn jobs_of(this: This, lists: &[This], release: bool) -> Vec<Job> {
 /// nothing, behind the flights in the air, or now.
 pub(super) fn signal(this: This, fence: This, value: u64) {
     let fence = fence as usize;
-    LANE.push_behind(this as usize, false, Job::Signal(fence, value), || {
-        if !crate::host::late_signal(fence, value) {
-            crate::fence::set(fence as This, value);
-        }
-    });
+    LANE.push_behind(this as usize, false, Job::Signal(fence, value), || late_or_now(fence, value));
+}
+
+/// A signal behind the flights in the air (the line holds a COM reference
+/// on the fence until it is set, `crate::fence::FenceRef`), or now if none
+/// fly. (The line's own jobs still hold the fence's address: a fence the
+/// title releases while its signal waits here is not kept alive.)
+fn late_or_now(fence: usize, value: u64) {
+    if let Err(fence) = crate::host::late_signal(crate::fence::FenceRef::new(fence as This), value) {
+        crate::fence::set(fence.as_this(), value);
+    }
 }
 
 /// Queue `this` waits for `fence`: nothing if it has nothing in the line and
