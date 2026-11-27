@@ -97,6 +97,33 @@ in [docs/ports-2026-11-27-zeex64.md](docs/ports-2026-11-27-zeex64.md).
   `VICTORY_NO_WATCHDOG=1`, `VICTORY_SKIP_BINK=1|all`,
   `VICTORY_SKIP_INTRO=<sec>`, `VICTORY_SAMPLE=<ms>`.
 
+### Ported from hle-d3d12-runtime and foxvic-scarlett (2026-11-27)
+
+Two more forks were read the same day and every candidate was vetted by an
+independent skeptic pass before anything was merged: the
+[LibsMQG/hle-d3d12-runtime](https://github.com/LibsMQG/hle-d3d12-runtime) fork
+(unrelated history, built on RYUKI) and
+[randomkidmakesthis/foxvic-scarlett](https://github.com/randomkidmakesthis/foxvic-scarlett)
+(a foxhound × scarlett merge). What was taken, adapted, or refused and why is in
+[docs/ports-2026-11-27-hle-foxvic.md](docs/ports-2026-11-27-hle-foxvic.md).
+
+- **Correctness fixes, on by default**: use-after-free in command-queue release
+  and fence waits/signals; a dropped view heap's cached descriptor run; a null
+  constant-buffer write now replacing the old descriptor; a placement claiming
+  its pages at once and giving back exactly the pages it locked, with title
+  buffers refused in place under late waits; texture allocation-info alignment
+  and an empty query heap; two frame waits taking two ticks; a snapshot
+  allocation retried after idle buffers are let go; XGameSave validation and
+  quota arithmetic, DirectStorage and gamepad out-parameter contracts, the XMA
+  decoder's APU heap lifetime; `v_div_fixup_f32` turning `0.0/x` and `x/Inf`
+  into `±Inf`, `_g16` gradient packing, and `annotateHandle` kept block-local so
+  AMD's DXIL compiler no longer crashes.
+- **Opt-in, off by default**: `VICTORY_PORT_BUFFERS=1` (title buffers in place
+  above 4 GiB, big ones kept on the card), `VICTORY_STAGED_ONLY_TITLE=1` (the
+  texture pass asks only textures at a title address), and
+  `VICTORY_EXACT_NO_WAIT=1` (a bake's exact refresh reads through the kernel
+  before waiting for a remap).
+
 ## How to run it
 
 You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader model
