@@ -2195,7 +2195,6 @@ fn arena_holds(start: usize, end: usize) -> bool {
 }
 
 /// Whether `at` lies in a placeholder reservation of the runtime's.
-#[allow(dead_code)]
 pub(crate) fn in_placeholder(at: usize) -> bool {
     arena_holds(at, at.saturating_add(1))
 }

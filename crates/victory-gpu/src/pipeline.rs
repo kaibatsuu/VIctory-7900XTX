@@ -171,7 +171,9 @@ impl Shader {
             .get_or_init(|| {
                 let done = {
                     let _translation = crate::timeline::span("pipeline: translate a shader");
-                    translate(&self.container)
+                    // On a large stack when needed (`make::on_a_large_stack`):
+                    // first use may run on a title thread (1 MiB stack).
+                    make::on_a_large_stack(|| translate(&self.container))
                 };
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
@@ -213,7 +215,7 @@ impl Shader {
     /// Cached apart from [`translated`], so the normal translation is kept.
     pub(crate) fn translated_disabled(&self, mnemonic: &str) -> Option<&Translated> {
         self.translated_fallback
-            .get_or_init(|| translate_with(&self.container, &[mnemonic.to_owned()]).ok())
+            .get_or_init(|| make::on_a_large_stack(|| translate_with(&self.container, &[mnemonic.to_owned()])).ok())
             .as_ref()
     }
 

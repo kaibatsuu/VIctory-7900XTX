@@ -111,10 +111,14 @@ impl Pending {
 
     fn make(&self) {
         self.made.get_or_init(|| {
+            if listed_out(&self.shaders) {
+                tracing::info!(shaders = ?self.shaders, "listed in VICTORY_LEAVE_OUT: no host pipeline made");
+                return None;
+            }
             let _building = crate::timeline::span("pipeline: build a host pipeline");
             let began = Instant::now();
             let made = if isolate() {
-                isolated_make(&self.key, &self.shaders, self.graphics.as_deref())
+                on_a_large_stack(|| isolated_make(&self.key, &self.shaders, self.graphics.as_deref()))
             } else {
                 let fallback = fallback_for(&self.shaders);
                 if crashed_before(&self.key, &fallback) {
@@ -129,9 +133,11 @@ impl Pending {
                     // A shader the bisect found crashing this driver: made with
                     // its cached fallback here too, not only behind a canary.
                     tracing::info!(shaders = ?self.shaders, %mnemonic, "host pipeline made with the cached fallback (not isolated)");
-                    HostPipeline::new_with(&self.shaders, self.graphics.as_deref(), Some((hash.as_str(), mnemonic)))
+                    on_a_large_stack(|| {
+                        HostPipeline::new_with(&self.shaders, self.graphics.as_deref(), Some((hash.as_str(), mnemonic)))
+                    })
                 } else {
-                    HostPipeline::new(&self.shaders, self.graphics.as_deref())
+                    on_a_large_stack(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()))
                 }
             };
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
@@ -140,6 +146,65 @@ impl Pending {
         let (lock, done) = done_of(self);
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
+    }
+}
+
+/// Whether a shader is one the user names in
+/// `VICTORY_LEAVE_OUT=<hash>,...` (the 16 digits the log names it by): for
+/// programs the host cannot compile at all, whose pipeline is then not
+/// made and whose draws and dispatches are left out.
+pub(super) fn listed_out(shaders: &[Arc<Shader>]) -> bool {
+    static OUT: OnceLock<Vec<String>> = OnceLock::new();
+    let out = OUT.get_or_init(|| {
+        std::env::var("VICTORY_LEAVE_OUT")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    !out.is_empty() && shaders.iter().any(|s| out.iter().any(|h| *h == s.hash))
+}
+
+thread_local! {
+    /// Whether this thread has a stack made for pipelines (a worker's).
+    static LARGE_STACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether what goes deep is run on a stack made for it
+/// ([`on_a_large_stack`]): `VICTORY_LARGE_STACK`, `1` or `0`; unset, under
+/// Wine only (where it was needed, and tested).
+fn large_stacks() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_LARGE_STACK").ok().as_deref() {
+        Some("1") => true,
+        Some("0") => false,
+        _ => crate::host::on_wine(),
+    })
+}
+
+/// Runs `make` (a host pipeline's making, a shader's translation) on a
+/// stack large enough for it: here if this is a worker (or
+/// [`large_stacks`] says no), else on a thread of its own, waited for.
+pub(crate) fn on_a_large_stack<T: Send>(make: impl FnOnce() -> T + Send) -> T {
+    if LARGE_STACK.with(|l| l.get()) || !large_stacks() {
+        return make();
+    }
+    let mut make = Some(make);
+    let made = std::thread::scope(|s| {
+        let spawned = std::thread::Builder::new()
+            .name("victory-pipeline-now".into())
+            .stack_size(victory_shader::emit::PIPELINE_STACK)
+            .spawn_scoped(s, || {
+                LARGE_STACK.with(|l| l.set(true));
+                (make.take().expect("taken once"))()
+            });
+        spawned.ok().and_then(|thread| thread.join().ok())
+    });
+    match made {
+        Some(made) => made,
+        // No thread to be had: here after all.
+        None => (make.take().expect("not run on a thread"))(),
     }
 }
 
@@ -1081,11 +1146,19 @@ fn workers() -> bool {
         tracing::info!(workers, "pipeline workers");
         super::library::start_saver();
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
+        let use_large = large_stacks();
         for i in 0..workers + screens {
             let screens_only = i >= workers;
-            let spawned = std::thread::Builder::new()
-                .name(format!("victory-pipelines-{i}"))
-                .spawn(move || {
+            let mut builder = std::thread::Builder::new().name(format!("victory-pipelines-{i}"));
+            if use_large {
+                // Pipeline creation converts DXIL on this thread (under
+                // vkd3d-proton, on its stack).
+                builder = builder.stack_size(victory_shader::emit::PIPELINE_STACK);
+            }
+            let spawned = builder.spawn(move || {
+                    if use_large {
+                        LARGE_STACK.with(|l| l.set(true));
+                    }
                     // Below the title's own threads (loading, recording), and
                     // the streaming one, which is below normal itself
                     // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).

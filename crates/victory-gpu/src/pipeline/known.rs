@@ -290,6 +290,7 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
         each(*n, None);
         let began = std::time::Instant::now();
         let made = parse(entry, &mut read)
+            .filter(|(shaders, _)| !super::make::listed_out(shaders))
             .and_then(|(shaders, g)| HostPipeline::new(&shaders, g.as_deref()))
             .is_some();
         each(*n, Some((began.elapsed().as_secs_f64() * 1e3, made)));
@@ -361,6 +362,9 @@ pub fn make_pending(bytes: &[u8], fallback: Option<(&str, &str)>) -> bool {
         };
         Some(Box::new(g))
     };
+    if super::make::listed_out(&shaders) {
+        return false;
+    }
     HostPipeline::new_with(&shaders, graphics.as_deref(), fallback).is_some()
 }
 

@@ -765,6 +765,12 @@ pub(crate) struct Digest(pub(crate) u128);
 /// what lies there is another texture's. (After victory-amd 4436f8f1.)
 pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     let first = if crate::resource::held_only() { first } else { 0 };
+    // Asked before in this list: nothing is left to do, whatever the answer
+    // below would be, and the lock all recording threads share is left alone
+    // (`VICTORY_UPLOAD_ASKED=0`: asked for first, as before).
+    if crate::toggled!("VICTORY_UPLOAD_ASKED") && list.used(1 << 63 | (resource as usize) << 4 | first as usize & 15) {
+        return;
+    }
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1272,6 +1278,14 @@ impl Staging {
     /// The title memory the texture is read from: address and bytes.
     pub(crate) fn memory(&self) -> (usize, usize) {
         (self.memory as usize, self.read)
+    }
+
+    /// The title memory a refresh asks the write watch about, if it asks:
+    /// not a texture that is read once.
+    #[allow(dead_code)]
+    pub(crate) fn asked(&self) -> Option<(usize, usize)> {
+        (!self.once.load(std::sync::atomic::Ordering::Relaxed) && self.read != 0)
+            .then(|| (self.memory as usize, self.memory as usize + self.read))
     }
 
     /// The title's level and the array slice of the staging buffer's part
