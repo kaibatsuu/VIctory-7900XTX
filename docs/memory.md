@@ -116,6 +116,42 @@ and 2,523 MB was ever copied. `VICTORY_WINDOW_KB` (a finer grid) and
    its own list: up to about 2 GB more, but the title may submit a closed list again.
 5. **A page file for the commit**: no code, no RAM.
 
+## Keeping a log of it
+
+The memory line is prose, five seconds apart, in the log. For a run long enough
+that the growth matters, a diagnostics build writes the same numbers as a CSV:
+`VICTORY_MEMLOG=<file>`. One line each time the memory line is made, a header
+first, `t_ms,unix_ms,frame`, then: `private_mb`, `working_mb`, `free_phys_mb`,
+`commit_left_mb`; the card's `vram_local_budget_mb` and `vram_local_used_mb`, and
+the PC's memory shared with it `vram_shared_budget_mb`, `vram_shared_used_mb`;
+then the holders the memory lines name — `host_copies_mb`, `window_count`,
+`windows_mb`, `snapshots_mb`, `window_held_mb`, `staging_live_mb`,
+`texture_host_mb`, `texture_host_count`, `title_textures_no_copy_mb`,
+`title_targets_mb`, `title_targets_count`, `texture_pool_mb`, `staging_pool_mb`,
+`views_kept`, `views_free`, `views_mb`, `view_shapes`, `host_lists_alive`,
+`host_lists_made`, `preludes_made`, `list_scratch_mb`, `list_scratch_spare_mb`,
+`list_other_uploads_mb`, `own_alloc_mb`, `own_alloc_blocks`,
+`shader_containers_mb`, `translations_mb`, `pipeline_file_mb`.
+
+`tools\memlog.ps1 -Csv <file>` reads it and prints, for every column, the first
+and last value, the change a minute and the steepest rise in one minute, then a
+timeline, the columns that grew most first. A column that climbs while the
+session idles, or in play at a steady megabytes a minute, names its holder
+directly: `view_shapes` growing 22 MB a minute in run 5's play is the shapes
+table above, `own_alloc_mb` climbing with `preludes_made` is the host lists.
+
+Put the file outside this checkout: tools refuse game-derived output below a
+directory that holds `.victory-root` ([asset-policy.md](asset-policy.md)), and a
+run's memory is a run's. The writer runs on the meter thread, the one that makes
+the memory line, so it costs the presenting thread nothing; a file that cannot be
+opened is said once and the log stays off.
+
+`tools\memwatch.ps1` asks the same question from outside, of any build (release
+included): it samples a running `victory.exe`'s working set, private bytes and
+the VRAM the GPU's counters charge to the process, local and non-local, every
+couple of seconds, to a CSV and a summary. It needs no rebuild, but it sees only
+totals: the breakdown is the layer's own CSV above.
+
 ## How it was measured
 
 The memory lines of the logs (`copystat.rs`; the map, `VICTORY_MEMORY_MAP`, is on by
