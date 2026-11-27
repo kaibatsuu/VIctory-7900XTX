@@ -183,21 +183,29 @@ pub(crate) extern "system" fn wait(
         wait = Duration::ZERO;
     }
     let _called = crate::timeline::span("the title's frame wait");
-    let hr = if wait > limit {
-        std::thread::sleep(limit);
-        TIMEOUT
-    } else {
-        if !wait.is_zero() {
-            std::thread::sleep(wait);
+    // The tick is this waiter's only when it advanced `last`: two waits
+    // that wake together otherwise both end on it. A loser waits again on
+    // the next tick, until its deadline (measured from the call, so a
+    // sleep that woke late does not stretch it).
+    let mut slept = Duration::ZERO;
+    let hr = loop {
+        if wait > limit.saturating_sub(slept) {
+            std::thread::sleep(limit.saturating_sub(slept));
+            break TIMEOUT;
         }
-        last(kind).fetch_max(tick, Ordering::Relaxed);
-        S_OK
+        std::thread::sleep(wait);
+        slept += wait;
+        if last(kind).fetch_max(tick, Ordering::Relaxed) < tick {
+            break S_OK;
+        }
+        let (next, until) = next_tick(kind);
+        (tick, wait) = (next, until);
     };
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         use crate::copystat::{C, add};
         add(C::PaceWaits, 1);
-        add(C::PaceUs, wait.min(limit).as_micros() as u64);
+        add(C::PaceUs, slept.min(limit).as_micros() as u64);
     }
     // A frame begun on a time-out takes no tick: its flip still does.
     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
@@ -384,5 +392,36 @@ mod tests {
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP);
         assert!(tick > flips[3]);
+
+        // Two waits that wake together take two ticks: one does not end on
+        // the tick another has claimed, both succeed, and the last tick a
+        // wait ended on has moved two on. (Both waits start behind a
+        // barrier, so they meet the tick together; the pre-claim code gave
+        // both the same one and left the last one short.)
+        assert_eq!(set_interval(null, null, 10_000, 2, 0), S_OK);
+        let _ = wait(null, 0, 0, std::ptr::null(), TOKEN_ON_TIMEOUT, &mut token);
+        let before = LAST[2].load(Ordering::Relaxed);
+        let go = std::sync::Barrier::new(2);
+        let results: Vec<HRESULT> = std::thread::scope(|s| {
+            // `wait` does not dereference `this`; each thread builds its own
+            // null (a raw pointer does not cross a closure capture's Send).
+            let joins = (0..2)
+                .map(|_| {
+                    s.spawn(|| {
+                        let this: This = std::ptr::null();
+                        let mut token = 0;
+                        go.wait();
+                        wait(this, FLIP, u32::MAX, std::ptr::null(), 0, &mut token)
+                    })
+                })
+                .collect::<Vec<_>>();
+            joins.into_iter().map(|j| j.join().unwrap()).collect()
+        });
+        assert_eq!(results, [S_OK; 2]);
+        assert_eq!(
+            LAST[2].load(Ordering::Relaxed),
+            before + 2,
+            "each wait took its own tick"
+        );
     }
 }
