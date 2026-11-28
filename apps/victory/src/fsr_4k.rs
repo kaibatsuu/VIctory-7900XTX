@@ -10,7 +10,8 @@ const STOCK_SDR_MODE: [u8; 16] = [0, 15, 0, 0, 112, 8, 0, 0, 60, 0, 0, 0, 1, 0, 
 pub(super) enum FsrPreset {
     /// Native resolution through the title's own no-FSR branch: the scene
     /// renders at the output size, and the temporal renderer is left as the
-    /// title chose it (not forced to the FSR one).
+    /// title chose it (not forced to the FSR one). This is above the Series X
+    /// profile's 2/3 scale (2560x1440), so it is opt-in and slower.
     Native,
     Quality,
     Balanced,
