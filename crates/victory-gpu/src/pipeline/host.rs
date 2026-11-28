@@ -1666,6 +1666,73 @@ mod tests {
         }
     }
 
+    /// The depth-of-field composite draws a half-res blurred colour over the
+    /// sharp foreground with premultiplied alpha: `ONE` / `INV_SRC_ALPHA` on
+    /// an sRGB target. Nothing in the translation may rewrite those factors
+    /// (a `SRC_ALPHA` / `INV_SRC_ALPHA` composite double-multiplies the
+    /// blurred colour), and an sRGB target must keep its `_SRGB` format: the
+    /// blend happens on the linear values the host converts to and from.
+    #[test]
+    fn a_premultiplied_composite_keeps_its_factors_on_an_srgb_target() {
+        let mut blend = GraphicsState::default().blend;
+        for t in &mut blend.RenderTarget {
+            t.BlendEnable = true.into();
+            t.SrcBlend = D3D12_BLEND_ONE;
+            t.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+            t.BlendOp = D3D12_BLEND_OP_ADD;
+            t.SrcBlendAlpha = D3D12_BLEND_ONE;
+            t.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+            t.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        }
+        for format in [
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+            DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+        ] {
+            // Through the stream reader the PSO is made from: subobject kind
+            // 8 is the blend state at +4, kind 15 the render target formats.
+            let mut state = GraphicsState::default();
+            let mut blend_bytes = vec![0u8; 4 + size_of::<D3D12_BLEND_DESC>()];
+            blend_bytes[..4].copy_from_slice(&8u32.to_le_bytes());
+            // SAFETY: the destination is that large; `blend` is a plain value.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (&raw const blend).cast::<u8>(),
+                    blend_bytes.as_mut_ptr().add(4),
+                    size_of::<D3D12_BLEND_DESC>(),
+                );
+            }
+            // SAFETY: a whole subobject of kind 8 at `blend_bytes`.
+            unsafe { state.read(8, blend_bytes.as_ptr()) };
+            assert_eq!(state.blend.RenderTarget[0], blend.RenderTarget[0], "{format:?}");
+            let array = targets(&[format]);
+            let mut target_bytes = vec![0u8; 4 + size_of::<D3D12_RT_FORMAT_ARRAY>()];
+            target_bytes[..4].copy_from_slice(&15u32.to_le_bytes());
+            // SAFETY: the destination is that large; `array` is a plain value.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (&raw const array).cast::<u8>(),
+                    target_bytes.as_mut_ptr().add(4),
+                    size_of::<D3D12_RT_FORMAT_ARRAY>(),
+                );
+            }
+            // SAFETY: a whole subobject of kind 15 at `target_bytes`.
+            unsafe { state.read(15, target_bytes.as_ptr()) };
+            assert_eq!(state.targets.RTFormats[0], format, "read keeps the format");
+            let host = host_blend(&state.blend, &state.targets);
+            assert_eq!(host.RenderTarget[0], blend.RenderTarget[0], "{format:?}");
+            assert_eq!(host.RenderTarget[0].SrcBlend, D3D12_BLEND_ONE, "{format:?}");
+            assert_eq!(
+                host.RenderTarget[0].DestBlend,
+                D3D12_BLEND_INV_SRC_ALPHA,
+                "{format:?}"
+            );
+            // The host PSO names the target the title named.
+            let kept = crate::resource::target_format(crate::resource::pc_format(format.0 as u32));
+            assert_eq!(kept, format.0 as u32, "{format:?}");
+        }
+    }
+
     #[test]
     fn blend_states_without_integer_blending_are_kept() {
         // No integer target.

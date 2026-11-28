@@ -3686,6 +3686,112 @@ fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     }
 }
 
+/// The plane (`PlaneSlice`) a shader resource view reads: 1 for the stencil
+/// plane of a depth-stencil texture, 0 (the depth plane, or any other view)
+/// otherwise.
+fn srv_plane(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u32 {
+    // SAFETY: the union member the view's dimension names.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => desc.Anonymous.Texture2D.PlaneSlice,
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => desc.Anonymous.Texture2DArray.PlaneSlice,
+            _ => 0,
+        }
+    }
+}
+
+/// The description of a whole depth texture as a shader resource view in
+/// `read`, the format of the plane it reads: what a view with no description
+/// asks for on the console, spelled out because a host view of the typeless
+/// copy needs a format. A multisampled texture gets its multisampled
+/// dimension (a plain 2D view of it is one the host refuses).
+fn whole_depth_view(own: &D3D12_RESOURCE_DESC, read: u32) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+    let array = own.DepthOrArraySize > 1;
+    let samples = own.SampleDesc.Count > 1;
+    let dimension = match (array, samples) {
+        (false, false) => D3D12_SRV_DIMENSION_TEXTURE2D,
+        (true, false) => D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+        (false, true) => D3D12_SRV_DIMENSION_TEXTURE2DMS,
+        (true, true) => D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY,
+    };
+    let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT(read as i32),
+        ViewDimension: dimension,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        ..Default::default()
+    };
+    desc.Anonymous = match (array, samples) {
+        (false, false) => D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2D: D3D12_TEX2D_SRV {
+                MostDetailedMip: 0,
+                MipLevels: u32::MAX,
+                PlaneSlice: 0,
+                ResourceMinLODClamp: 0.0,
+            },
+        },
+        (true, false) => D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                MostDetailedMip: 0,
+                MipLevels: u32::MAX,
+                ArraySize: u32::from(own.DepthOrArraySize),
+                FirstArraySlice: 0,
+                PlaneSlice: 0,
+                ResourceMinLODClamp: 0.0,
+            },
+        },
+        (false, true) => D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2DMS: D3D12_TEX2DMS_SRV {
+                UnusedField_NothingToDefine: 0,
+            },
+        },
+        (true, true) => D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2DMSArray: D3D12_TEX2DMS_ARRAY_SRV {
+                FirstArraySlice: 0,
+                ArraySize: u32::from(own.DepthOrArraySize),
+            },
+        },
+    };
+    desc
+}
+
+/// Rewrites `view` of a depth texture the title made in `title` into the view
+/// the host takes: the plane's colour format, and `PlaneSlice` 1 for a view
+/// in a stencil format. `false`: nothing changed.
+fn depth_srv(title: u32, view: &mut D3D12_SHADER_RESOURCE_VIEW_DESC) -> bool {
+    let named = view.Format.0 as u32;
+    // A view in a stencil format reads the stencil plane: the host's
+    // stencil view is that format with `PlaneSlice` 1, whatever the title
+    // said.
+    let stencil = crate::resource::stencil_format(named);
+    let plane = if stencil { 1 } else { srv_plane(view) };
+    let Some(read) = crate::resource::depth_read_view(title, named, plane) else {
+        return false;
+    };
+    let moved = stencil && srv_plane(view) != 1;
+    if read == named && !moved {
+        return false;
+    }
+    view.Format = DXGI_FORMAT(read as i32);
+    if stencil {
+        srv_set_plane(view, 1);
+    }
+    true
+}
+
+/// Sets the `PlaneSlice` a shader resource view reads, for the dimensions
+/// that have one (a multisampled view is `TEXTURE2DMS`/`TEXTURE2DMSARRAY` and
+/// has none). Writing the union member the dimension names needs no
+/// invariant of its own.
+fn srv_set_plane(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, plane: u32) {
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => desc.Anonymous.Texture2D.PlaneSlice = plane,
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            desc.Anonymous.Texture2DArray.PlaneSlice = plane;
+        }
+        _ => {}
+    }
+}
+
 fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     let mut words = *words;
     words[0] = crate::resource::pc_format(words[0]);
@@ -4397,6 +4503,35 @@ fn constant_twinned(
     true
 }
 
+/// Says (the first 64 distinct ones) that a shader view of a depth texture
+/// reads its plane in a colour format: the format the title named, the one
+/// the view is made in. A wrong depth read shows as a flat circle of
+/// confusion, so the formats are worth having in the log.
+fn said_depth_view(resource: crate::object::This, own: u32, named: u32, read: u32, plane: u32) {
+    static SAID: Mutex<Vec<(u32, u32, u32, u32)>> = Mutex::new(Vec::new());
+    // (The cap is checked without the lock: a title that remakes its depth
+    // views every frame must not serialise its recording threads on this.)
+    static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    use std::sync::atomic::Ordering::Relaxed;
+    if COUNT.load(Relaxed) >= 64 {
+        return;
+    }
+    let key = (own, named, read, plane);
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if said.len() < 64 && !said.contains(&key) {
+        said.push(key);
+        COUNT.store(said.len() as u32, Relaxed);
+        tracing::info!(
+            resource = format_args!("{:#x}", resource as usize),
+            texture_format = own,
+            view_format = named,
+            read_format = read,
+            plane,
+            "shader view of a depth texture, read in the plane's colour format"
+        );
+    }
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -4474,6 +4609,47 @@ fn make_twinned(
                     }
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
+                // A host shader resource view cannot name a depth format, and
+                // the host copy of a depth texture a shader reads is typeless
+                // (so it needs a format spelled out): the view reads the
+                // plane's colour format. The title names the depth format, or
+                // none at all, meaning the texture's own.
+                // SAFETY: a live resource.
+                let own = unsafe { texture.GetDesc() };
+                let own_format = own.Format.0 as u32;
+                let depth_host = own.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0
+                    || crate::resource::DEPTH_FORMATS
+                        .iter()
+                        .any(|&(_, typeless)| typeless == own_format);
+                if depth_host
+                    && let Some(title) = crate::resource::title_format(resource)
+                {
+                    match desc.as_mut() {
+                        Some(view) => {
+                            let named = view.Format.0 as u32;
+                            let plane = if crate::resource::stencil_format(named) {
+                                1
+                            } else {
+                                srv_plane(view)
+                            };
+                            if depth_srv(title, view) {
+                                said_depth_view(
+                                    resource,
+                                    title,
+                                    named,
+                                    view.Format.0 as u32,
+                                    plane,
+                                );
+                            }
+                        }
+                        None => {
+                            if let Some(read) = crate::resource::depth_read_view(title, 0, 0) {
+                                said_depth_view(resource, title, 0, read, 0);
+                                desc = Some(whole_depth_view(&own, read));
+                            }
+                        }
+                    }
+                }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
@@ -5204,6 +5380,167 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A depth texture's view with no description reads all of it, in the
+    /// plane's colour format: a host view of the typeless copy needs both
+    /// spelled out (the format it is read in, the slices it covers).
+    #[test]
+    fn a_depth_view_without_a_description_reads_the_whole_plane() {
+        let own = |depth_or_array: u16, format: DXGI_FORMAT| D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: depth_or_array,
+            MipLevels: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let one = whole_depth_view(&own(1, DXGI_FORMAT_R32_TYPELESS), 41);
+        assert_eq!(one.Format, DXGI_FORMAT_R32_FLOAT);
+        assert_eq!(one.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2D);
+        // SAFETY: the union member the dimension names.
+        unsafe {
+            assert_eq!(one.Anonymous.Texture2D.MipLevels, u32::MAX);
+            assert_eq!(one.Anonymous.Texture2D.PlaneSlice, 0);
+        }
+        let array = whole_depth_view(&own(6, DXGI_FORMAT_R24G8_TYPELESS), 46);
+        assert_eq!(array.Format, DXGI_FORMAT_R24_UNORM_X8_TYPELESS);
+        assert_eq!(array.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2DARRAY);
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(array.Anonymous.Texture2DArray.ArraySize, 6);
+            assert_eq!(array.Anonymous.Texture2DArray.PlaneSlice, 0);
+        }
+        // A multisampled depth texture is viewed in its multisampled
+        // dimension, in the same colour format.
+        let mut ms = own(2, DXGI_FORMAT_R24G8_TYPELESS);
+        ms.SampleDesc.Count = 4;
+        let ms = whole_depth_view(&ms, 46);
+        assert_eq!(ms.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY);
+        // SAFETY: the union member the dimension names.
+        unsafe {
+            assert_eq!(ms.Anonymous.Texture2DMSArray.ArraySize, 2);
+            assert_eq!(ms.Anonymous.Texture2DMSArray.FirstArraySlice, 0);
+        }
+        let mut one_sample = own(1, DXGI_FORMAT_D32_FLOAT);
+        one_sample.SampleDesc.Count = 8;
+        let one_sample = whole_depth_view(&one_sample, 41);
+        assert_eq!(one_sample.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2DMS);
+        // The plane a view reads is its own: 1 for the stencil.
+        let stencil = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_X24_TYPELESS_G8_UINT,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    FirstArraySlice: 0,
+                    PlaneSlice: 1,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        assert_eq!(srv_plane(&stencil), 1);
+        assert_eq!(srv_plane(&one), 0);
+        // A view in a stencil format reads the stencil plane: the format is
+        // the host's stencil one and `PlaneSlice` becomes 1, whatever the
+        // title said (it named the plane by the format).
+        let mut stencil_view = stencil;
+        // SAFETY: the union member the dimension names.
+        assert_eq!(unsafe { stencil_view.Anonymous.Texture2DArray.PlaneSlice }, 1);
+        stencil_view.Anonymous.Texture2DArray.PlaneSlice = 0;
+        assert!(depth_srv(45, &mut stencil_view), "a D24S8 stencil view moved to plane 1");
+        assert_eq!(stencil_view.Format, DXGI_FORMAT_X24_TYPELESS_G8_UINT);
+        // SAFETY: the union member the dimension names.
+        assert_eq!(unsafe { stencil_view.Anonymous.Texture2DArray.PlaneSlice }, 1);
+        // A depth format is read in the plane's colour format.
+        let mut depth = one;
+        assert!(!depth_srv(40, &mut depth), "already the colour format");
+        depth.Format = DXGI_FORMAT_D32_FLOAT;
+        assert!(depth_srv(40, &mut depth));
+        assert_eq!(depth.Format, DXGI_FORMAT_R32_FLOAT);
+        // A buffer view reads no plane.
+        let buffer = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            ..Default::default()
+        };
+        assert_eq!(srv_plane(&buffer), 0);
+    }
+
+    /// The view the host makes for a depth texture: a null description is
+    /// spelled out, and a view naming the depth format is made in the plane's
+    /// colour format; the device is still there afterwards (an invalid view
+    /// removes it).
+    #[test]
+    fn a_title_depth_texture_gets_a_host_shader_view() {
+        let Some(host) = host() else { return };
+        // D32_FLOAT, with depth-stencil access (the title's flag bit 2).
+        let texture = crate::resource::test_texture(DXGI_FORMAT_D32_FLOAT.0 as u32, 0x2);
+        // SAFETY: plain heap creation.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            host.device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        // SAFETY: a live heap of one descriptor.
+        let at = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+        // Texture2D, all mips, plane 0, naming the texture's depth format.
+        // (The union is 8-byte aligned: word 3 is its padding.)
+        let words = |format: i32| {
+            [
+                format as u32,
+                4,
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                0,
+                0,
+                u32::MAX,
+                0,
+                0,
+                0,
+                0,
+            ]
+        };
+        let described =
+            make(&View::Shader(texture as usize, Some(words(DXGI_FORMAT_D32_FLOAT.0))), at);
+        assert!(
+            described.is_some(),
+            "a view naming D32_FLOAT is made in R32_FLOAT"
+        );
+        // SAFETY: a plain query of a live device.
+        assert!(
+            unsafe { host.device.GetDeviceRemovedReason() }.is_ok(),
+            "the described view"
+        );
+        assert!(
+            make(&View::Shader(texture as usize, None), at).is_some(),
+            "a view with no description is made"
+        );
+        let colour = make(
+            &View::Shader(texture as usize, Some(words(DXGI_FORMAT_R32_FLOAT.0))),
+            at,
+        );
+        assert!(colour.is_some(), "a view already in the colour format is made as it is");
+        // A multisampled depth texture: its whole view is the multisampled
+        // dimension, in the plane's colour format.
+        let ms = crate::resource::test_texture_samples(DXGI_FORMAT_D32_FLOAT.0 as u32, 0x2, 4);
+        assert!(
+            make(&View::Shader(ms as usize, None), at).is_some(),
+            "a multisampled view with no description is made"
+        );
+        // SAFETY: a plain query of a live device.
+        assert!(
+            unsafe { host.device.GetDeviceRemovedReason() }.is_ok(),
+            "the host takes the views"
+        );
+    }
 
     /// Every host sampler heap backs all 2,048 hardware descriptors and
     /// reserves slot 2,047 as a null sentinel so `umin(index, 2047)` in

@@ -690,6 +690,69 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
 /// typeless depth resources.
 pub(crate) const DEPTH_FORMATS: [(u32, u32); 4] = [(20, 19), (40, 39), (45, 44), (55, 53)];
 
+/// The format a shader resource view of a depth texture's plane must name on
+/// the host: a host shader resource view cannot name a depth format. Plane 0
+/// is the depth, read in the format of its colour twin (`D32_FLOAT` as
+/// `R32_FLOAT`, `D24_UNORM_S8_UINT` as `R24_UNORM_X8_TYPELESS`, `D16_UNORM`
+/// as `R16_UNORM`); plane 1 is the stencil, whose view formats are the
+/// `X24_TYPELESS_G8_UINT` and `X32_TYPELESS_G8X24_UINT` ones.
+///
+/// `format` is any format of the depth-stencil families (the typeless one,
+/// the depth-stencil one, the depth-plane one or the stencil one); `None`
+/// for a format that is none of them.
+pub(crate) fn depth_read_format(format: u32, plane: u32) -> Option<u32> {
+    Some(match format {
+        // R32_TYPELESS, D32_FLOAT, R32_FLOAT: N32-float depth.
+        39..=41 => 41,
+        // R32G8X24_TYPELESS, D32_FLOAT_S8X24_UINT, R32_FLOAT_X8X24_TYPELESS,
+        // X32_TYPELESS_G8X24_UINT: 32-bit depth with 8 bits of stencil.
+        19..=22 if plane == 1 => 22,
+        19..=22 => 21,
+        // R24G8_TYPELESS, D24_UNORM_S8_UINT, R24_UNORM_X8_TYPELESS,
+        // X24_TYPELESS_G8_UINT: 24-bit depth with 8 bits of stencil.
+        44..=47 if plane == 1 => 47,
+        44..=47 => 46,
+        // R16_TYPELESS, D16_UNORM, R16_UNORM: 16-bit depth.
+        53 | 55 | 56 => 56,
+        _ => return None,
+    })
+}
+
+/// [`depth_read_format`] for a view of a depth texture: the format the view
+/// names (0: none, which means the texture's own), made the host's colour
+/// read of the plane.
+///
+/// `texture_format` is the format the title made the texture in. A view that
+/// names no format asks for that one; it is only spelled out when it is a
+/// typed depth format, because a texture the title made typeless (39, 44, 53)
+/// may be a colour texture, and which typed view it meant is not ours to
+/// guess. A view that names a format is mapped whether or not the texture's
+/// own format is typed (`None` when the named format is not one of the depth
+/// families, so a UINT or SNORM view of the same family is left alone).
+pub(crate) fn depth_read_view(texture_format: u32, view_format: u32, plane: u32) -> Option<u32> {
+    let own = pc_format(texture_format);
+    let named = if view_format == 0 { own } else { pc_format(view_format) };
+    let typed_depth = DEPTH_FORMATS.iter().any(|&(typed, _)| typed == own);
+    if view_format == 0 && !typed_depth {
+        return None;
+    }
+    depth_read_format(named, plane)
+}
+
+/// Whether `format` is a shader resource view format of a stencil plane:
+/// `X24_TYPELESS_G8_UINT` (47) or `X32_TYPELESS_G8X24_UINT` (22), as the
+/// console's 16-bit depth-stencil view formats map to them. A host view in
+/// one of them reads the stencil only with `PlaneSlice` 1.
+pub(crate) fn stencil_format(format: u32) -> bool {
+    matches!(pc_format(format), 22 | 47)
+}
+
+/// The format the title described the resource in, before the host's mapping
+/// (`pc_format`): a view with no description asks for it.
+pub(crate) fn title_format(this: This) -> Option<u32> {
+    (!this.is_null()).then(|| resource(this).desc.format)
+}
+
 /// Mip levels, the full chain for 0.
 fn mip_count(desc: &ResourceDesc) -> u32 {
     let depth = if desc.dimension == TEXTURE_3D {
@@ -3603,6 +3666,51 @@ pub(crate) fn test_buffer(width: u64) -> This {
     out
 }
 
+/// A title texture of `format` with `flags` (2: depth-stencil access), for
+/// tests: 64 by 64, one mip, one slice, one sample.
+#[cfg(test)]
+pub(crate) fn test_texture(format: u32, flags: u32) -> This {
+    test_texture_samples(format, flags, 1)
+}
+
+/// [`test_texture`] with `samples` samples a texel.
+#[cfg(test)]
+pub(crate) fn test_texture_samples(format: u32, flags: u32, samples: u32) -> This {
+    let heap = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 0,
+        visible_nodes: 0,
+    };
+    let desc = ResourceDesc {
+        dimension: 3, // TEXTURE2D
+        alignment: 0,
+        width: 64,
+        height: 64,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format,
+        sample_count: samples,
+        sample_quality: 0,
+        layout: 0,
+        flags,
+    };
+    let mut out = std::ptr::null();
+    let hr = create_committed(
+        std::ptr::null(),
+        &heap,
+        0,
+        &desc,
+        0,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+    assert_eq!(hr, S_OK);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3636,6 +3744,67 @@ mod tests {
         assert_eq!(e5_stand_in_for(Some("R16G16B16A16")), 10);
         for other in ["", "0", "1", "on", "r11g11b10.0"] {
             assert_eq!(e5_stand_in_for(Some(other)), 10, "{other:?}");
+        }
+    }
+
+    /// A host shader resource view of a depth texture names the plane's
+    /// colour format: the depth-stencil format itself (`D32_FLOAT`,
+    /// `D24_UNORM_S8_UINT`, `D32_FLOAT_S8X24_UINT`) is one the host refuses.
+    #[test]
+    fn a_depth_view_is_read_in_the_planes_colour_format() {
+        // (texture format, plane, the view format the host takes).
+        for (format, plane, read) in [
+            (40, 0, 41),   // D32_FLOAT: R32_FLOAT
+            (39, 0, 41),   // R32_TYPELESS: R32_FLOAT
+            (45, 0, 46),   // D24_UNORM_S8_UINT: R24_UNORM_X8_TYPELESS
+            (44, 0, 46),   // R24G8_TYPELESS: R24_UNORM_X8_TYPELESS
+            (45, 1, 47),   // D24S8's stencil: X24_TYPELESS_G8_UINT
+            (44, 1, 47),   // R24G8's stencil: X24_TYPELESS_G8_UINT
+            (20, 0, 21),   // D32_FLOAT_S8X24_UINT: R32_FLOAT_X8X24_TYPELESS
+            (19, 0, 21),   // R32G8X24_TYPELESS: R32_FLOAT_X8X24_TYPELESS
+            (20, 1, 22),   // D32S8's stencil: X32_TYPELESS_G8X24_UINT
+            (55, 0, 56),   // D16_UNORM: R16_UNORM
+            (53, 0, 56),   // R16_TYPELESS: R16_UNORM
+        ] {
+            assert_eq!(depth_read_format(format, plane), Some(read), "{format} plane {plane}");
+        }
+        // A colour format of another family, or a colour one of the same
+        // family, is not a depth format: its view is left as the title has it.
+        for format in [0, 28, 42, 54, 57, 61, 87] {
+            assert_eq!(depth_read_format(format, 0), None, "{format}");
+        }
+    }
+
+    /// A view that names no format (the console's "the texture's own") of a
+    /// texture the title made in a typed depth format gets the plane's colour
+    /// format; a texture the title made typeless is not guessed at, and a
+    /// colour view of the same family (R32_UINT, R16_FLOAT) is left alone.
+    #[test]
+    fn a_depth_view_without_a_format_is_read_in_the_planes_colour_format() {
+        // The texture's own format is the typed depth one the title made it in.
+        assert_eq!(depth_read_view(40, 0, 0), Some(41));
+        assert_eq!(depth_read_view(45, 0, 0), Some(46));
+        assert_eq!(depth_read_view(20, 0, 0), Some(21));
+        assert_eq!(depth_read_view(55, 0, 0), Some(56));
+        // The title named the depth format, or the plane.
+        assert_eq!(depth_read_view(39, 40, 0), Some(41));
+        assert_eq!(depth_read_view(44, 45, 1), Some(47));
+        // A view that names a stencil format reads the stencil plane.
+        assert!(stencil_format(47));
+        assert!(stencil_format(22));
+        assert!(stencil_format(120)); // the console's 16-bit stencil view
+        assert!(!stencil_format(46));
+        assert!(!stencil_format(21));
+        // Not a depth family, or a colour format of the family: nothing to do.
+        assert_eq!(depth_read_view(27, 0, 0), None);
+        assert_eq!(depth_read_view(39, 42, 0), None);
+        assert_eq!(depth_read_view(53, 54, 0), None);
+        // An 8-bit colour view of a depth plane is left alone.
+        assert_eq!(depth_read_view(44, 62, 0), None);
+        // A texture the title made typeless, with no format named: the view it
+        // meant could be a colour one, so it is left refused.
+        for format in [39, 44, 53] {
+            assert_eq!(depth_read_view(format, 0, 0), None, "{format}");
         }
     }
 

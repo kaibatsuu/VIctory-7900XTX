@@ -1962,13 +1962,14 @@ impl<'a> Lower<'a> {
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
             // A host whose waves are at most 32 lanes (NVIDIA) refuses `WaveSize(64)`. A console
-            // wave64 program whose cross-lane code stays inside 32-lane halves – DPP rows,
-            // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there – runs
-            // exactly in waves of 32: the thread relabelling makes each host wave one half of a
-            // console wave (lanes 32k..32k+31). Not when it crosses halves (`v_mbcnt`,
-            // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
-            // masks), nor when LDS may be shared within the console wave without barriers (a
-            // group over 32 threads with LDS): those still need 64-lane waves.
+            // wave64 program whose cross-lane code stays inside 32-lane halves – DPP with a row
+            // mask of 0xF, `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines
+            // there – runs exactly in waves of 32: the thread relabelling makes each host wave one
+            // half of a console wave (lanes 32k..32k+31). Not when it crosses halves (`v_mbcnt`,
+            // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers, lane-constant masks,
+            // a DPP row mask that names rows past the first 32 lanes), nor when LDS may be shared
+            // within the console wave without barriers (a group over 32 threads with LDS): those
+            // still need 64-lane waves.
             if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
                 let crosses = insts().any(|i| {
                     let n = i.name();
@@ -1977,6 +1978,18 @@ impl<'a> Lower<'a> {
                         || n.starts_with("ds_permute")
                         || n.starts_with("ds_bpermute")
                         || reads_mask_as_data(x.st, i)
+                        // A DPP write mask names one of the console wave's four
+                        // rows of 16 lanes: rows 2 and 3 are the second host
+                        // wave's, so the mask is evaluated with the console lane
+                        // (the exchange's relabelling).
+                        || matches!(
+                            &i.fields,
+                            Fields::Valu(v)
+                                if matches!(
+                                    v.dpp,
+                                    Some(Dpp::Row { row_mask, .. }) if row_mask != 0xF
+                                )
+                        )
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
                 if !crosses && (s.lds_dwords == 0 || group <= 32) {
@@ -2039,6 +2052,15 @@ impl<'a> Lower<'a> {
                             "ds_(b)permute"
                         } else if reads_mask_as_data(x.st, i) {
                             "mask as data"
+                        } else if matches!(
+                            &i.fields,
+                            Fields::Valu(v)
+                                if matches!(
+                                    v.dpp,
+                                    Some(Dpp::Row { row_mask, .. }) if row_mask != 0xF
+                                )
+                        ) {
+                            "a DPP row mask"
                         } else {
                             continue;
                         };
@@ -8695,8 +8717,18 @@ impl<'a> Lower<'a> {
             }
         }
         if let Some((rows, banks)) = masks {
-            // Row (16 lanes) and bank (4 lanes of a row) write masks.
+            // Row (16 lanes) and bank (4 lanes of a row) write masks. The row
+            // is the console lane's: of a console wave64 program run in host
+            // waves of 32, a host wave holds console lanes 32k..32k+31, whose
+            // rows are 2k and 2k+1 (`lane >> 4` of a host lane is 0 and 1).
+            // The bank is the same either way (a wave's run of lanes starts
+            // at a multiple of 32).
             let (four, two, three) = (k(self, 4), k(self, 2), k(self, 3));
+            let lane = if self.console_lanes {
+                self.console_lane()
+            } else {
+                lane
+            };
             let ri = self.s.m.bin(c, Bin::LShr, lane, four);
             let ri = self.s.m.bin(c, Bin::And, ri, three);
             let bi = self.s.m.bin(c, Bin::LShr, lane, two);
