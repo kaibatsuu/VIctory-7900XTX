@@ -153,11 +153,12 @@ Then:
 scripts\play.ps1 -Exe <your copy's executable> -More @{VICTORY_PIPELINE_ISOLATE='1'}
 ```
 
-A launcher run starts at the Series X resolution by default: the scene at 2/3
-scale (2560x1440), upscaled to 3840x2160 through the title's FSR frontend
-(renderer 7). `-Fsr4K native` renders the scene at 3840x2160 instead (above the
-console, slower); `-Fsr4K balanced` trades sharpness for speed;
-`-More @{VICTORY_FSR_4K='0'}` leaves the console's own choice.
+A launcher run uses the Series X's 1440p display mode by default: the window and
+the scene are 2560x1440, rendered 1:1 with no upscaling (the title's own
+temporal resolve at 1.0), and the HUD scales with the output height. `-Fsr4K
+quality` (or `balanced`/`performance`) goes back to the 4K output with the
+title's FSR frontend instead; `-More @{VICTORY_OUTPUT='1920x1080'}` picks
+another of the title's display modes.
 
 With isolation the first launch of a new build stutters for a few minutes while
 each new pipeline is tested; later launches skip those already tested. A child that
@@ -266,8 +267,9 @@ the frame now is the one thread that submits the title's work to the card
 | Switch | What it does |
 |---|---|
 | `--console series-s` | The Series S profile: 1080p output, about 5 ms faster, a softer picture |
-| `VICTORY_OUTPUT=1920x1080` | The title renders to that output size itself (Series X profile; about 16 ms less card time) |
-| `VICTORY_FSR_4K=quality` | The launcher's default: the Series X resolution — the scene at 2/3 scale (2560x1440), upscaled to 3840x2160 through the title's FSR frontend (renderer 7); `native` renders at 3840x2160 (above the console, slower), `balanced`/`performance` are faster, `0` leaves the console's own choice |
+| `VICTORY_OUTPUT=2560x1440` | The launcher's default: one of the title's own display modes (720p/936p/1080p/1440p/4K), here the Series X's 1440p mode; for another size the back-buffer pool check is jumped over |
+| `VICTORY_RENDER_SCALE=1.0` | The launcher's default: the title's own upscaler's scene scale; 1.0 at the 1440p output renders the scene at the window's size (no upscaling) |
+| `VICTORY_FSR_4K=quality` | Opt-in: the 4K output with the title's FSR frontend at 2/3 scale (2560x1440 rendered and upscaled, renderer 7); `native` renders at 3840x2160 (above the console, slower), `balanced`/`performance` are faster, `0` (the launcher's default) leaves this path off |
 | `VICTORY_FRAME_INTERVAL_MS=16.667` | Lets the title go above 30 fps (menus and videos reach 60; the game's clock stays right) |
 | `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
 | `VICTORY_AMBIENT_BOOST=1.25`, `VICTORY_AMBIENT_CELLS=120` | Against rooms pulsing between too bright and too dark while standing still (off by default: 2.5 and `0`, the picture as before; not yet measured in a run) |

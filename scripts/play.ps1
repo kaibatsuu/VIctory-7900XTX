@@ -2,7 +2,7 @@
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
-# -Fsr4K        PC FidelityFX at 3840x2160, at the Series X scene scale by default (2560x1440 rendered and upscaled); native renders at 3840x2160 (above the console, slower), balanced/performance are faster, 0 for the console's own
+# -Fsr4K        the 4K output with the title's FSR frontend (quality, balanced or performance); by default the launcher runs the Series X 1440p mode, 2560x1440 rendered 1:1, with no upscaling
 # -Console      series-x (default) or series-s
 # -Uncap        no frame-rate limit at all (VICTORY_FRAME_INTERVAL_MS=0, VICTORY_TITLE_FPS=0); an experiment, not a playable setting
 # -Memory       the memory trims ported from victory-memory-stack (indirect budgets packed, command allocators taken anew)
@@ -25,11 +25,11 @@ $settings = @{
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '1'
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'
-    # The Series X profile: the scene at 2/3 scale (2560x1440), upscaled to 3840x2160 through the
-    # title's FSR frontend (renderer 7). `-Fsr4K native` renders at 3840x2160 instead (above the
-    # console, slower); `balanced`/`performance` trade sharpness for speed; `-More
-    # @{VICTORY_FSR_4K='0'}` leaves it to the console.
-    VICTORY_FSR_4K = 'quality'
+    # The Series X's 1440p display mode, rendered 1:1: the window and the scene are 2560x1440,
+    # with no upscaling (the title's own temporal resolve at 1.0), and the HUD scales with the
+    # output height. The FSR 4K profile patches the output size itself, so it stays off here.
+    # `-Fsr4K quality` (or balanced/performance) goes back to the 4K output with FSR instead.
+    VICTORY_OUTPUT = '2560x1440'; VICTORY_RENDER_SCALE = '1.0'; VICTORY_FSR_4K = '0'
 }
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
