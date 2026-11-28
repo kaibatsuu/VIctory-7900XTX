@@ -153,9 +153,10 @@ Then:
 scripts\play.ps1 -Exe <your copy's executable> -More @{VICTORY_PIPELINE_ISOLATE='1'}
 ```
 
-A launcher run starts with the title's FSR frontend at 4K quality by default
-(renderer 7; 2560x1440 rendered and upscaled). `-Fsr4K balanced` or
-`-Fsr4K performance` trade sharpness for speed; `-More @{VICTORY_FSR_4K='0'}`
+A launcher run starts at native 4K by default: the title's own no-FSR branch,
+with the scene rendered at 3840x2160 and the temporal renderer left as the
+title chose it. `-Fsr4K quality` (2560x1440 rendered and upscaled) or
+`-Fsr4K balanced` trades sharpness for speed; `-More @{VICTORY_FSR_4K='0'}`
 leaves the console's own choice.
 
 With isolation the first launch of a new build stutters for a few minutes while
@@ -266,7 +267,7 @@ the frame now is the one thread that submits the title's work to the card
 |---|---|
 | `--console series-s` | The Series S profile: 1080p output, about 5 ms faster, a softer picture |
 | `VICTORY_OUTPUT=1920x1080` | The title renders to that output size itself (Series X profile; about 16 ms less card time) |
-| `VICTORY_FSR_4K=quality` | The launcher's default: the title's FSR frontend at 4K (renderer 7, 2560x1440 rendered and upscaled); `balanced`/`performance` trade sharpness for speed, `0` leaves the console's own choice |
+| `VICTORY_FSR_4K=native` | The launcher's default: the title's own no-FSR branch renders the scene at 3840x2160; `quality`/`balanced`/`performance` render smaller and upscale (faster, softer), `0` leaves the console's own choice |
 | `VICTORY_FRAME_INTERVAL_MS=16.667` | Lets the title go above 30 fps (menus and videos reach 60; the game's clock stays right) |
 | `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
 | `VICTORY_AMBIENT_BOOST=1.25`, `VICTORY_AMBIENT_CELLS=120` | Against rooms pulsing between too bright and too dark while standing still (off by default: 2.5 and `0`, the picture as before; not yet measured in a run) |

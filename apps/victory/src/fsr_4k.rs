@@ -8,6 +8,10 @@ const STOCK_SDR_MODE: [u8; 16] = [0, 15, 0, 0, 112, 8, 0, 0, 60, 0, 0, 0, 1, 0, 
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FsrPreset {
+    /// Native resolution through the title's own no-FSR branch: the scene
+    /// renders at the output size, and the temporal renderer is left as the
+    /// title chose it (not forced to the FSR one).
+    Native,
     Quality,
     Balanced,
     Performance,
@@ -21,7 +25,7 @@ impl FsrPreset {
             Ok(name) => Self::from_name(&name.trim().to_ascii_lowercase())
                 .map(Some)
                 .with_context(|| {
-                    format!("VICTORY_FSR_4K={name}: expected quality, balanced, performance or 0")
+                    format!("VICTORY_FSR_4K={name}: expected native, quality, balanced, performance or 0")
                 }),
             Err(error) => Err(error.into()),
         }
@@ -29,6 +33,7 @@ impl FsrPreset {
 
     pub(super) fn from_name(name: &str) -> Option<Self> {
         match name {
+            "native" => Some(Self::Native),
             "quality" => Some(Self::Quality),
             "balanced" => Some(Self::Balanced),
             "performance" => Some(Self::Performance),
@@ -38,6 +43,7 @@ impl FsrPreset {
 
     pub(super) fn name(self) -> &'static str {
         match self {
+            Self::Native => "native",
             Self::Quality => "quality",
             Self::Balanced => "balanced",
             Self::Performance => "performance",
@@ -47,6 +53,8 @@ impl FsrPreset {
     // AMD SDK FFX_UPSCALE_QUALITY_MODE values and ratios.
     pub(super) fn mode(self) -> u8 {
         match self {
+            // Native takes the title's no-FSR branch, which stores a bool.
+            Self::Native => 0,
             Self::Quality => 1,
             Self::Balanced => 2,
             Self::Performance => 3,
@@ -55,6 +63,7 @@ impl FsrPreset {
 
     pub(super) fn render_scale(self) -> f32 {
         match self {
+            Self::Native => 1.0,
             Self::Quality => 2.0 / 3.0,
             Self::Balanced => 1.0 / 1.7,
             Self::Performance => 0.5,
@@ -92,7 +101,15 @@ pub(super) fn prepare_fsr_4k(image: &mut PreparedImage, preset: FsrPreset) -> Re
     );
     const NATIVE_LOAD: u32 = 0x028e_f6a8;
     const QUALITY_LOAD: u32 = 0x028e_f6b2;
-    if preset != FsrPreset::Quality {
+    // The title's own no-FSR branch loads a 1.0 scene scale; native takes it.
+    if preset == FsrPreset::Native {
+        ensure!(
+            *field::<4>(image, 0x05fc_6ed8)? == 1.0f32.to_le_bytes(),
+            "Unexpected Series X native render scale"
+        );
+    }
+    let scaled = matches!(preset, FsrPreset::Balanced | FsrPreset::Performance);
+    if scaled {
         ensure!(
             *field::<10>(image, NATIVE_LOAD)?
                 == [0xc5, 0xfa, 0x10, 0x05, 0x28, 0x78, 0x6d, 0x03, 0xeb, 0x08]
@@ -101,27 +118,38 @@ pub(super) fn prepare_fsr_4k(image: &mut PreparedImage, preset: FsrPreset) -> Re
             "Unexpected Series X FSR scale instructions"
         );
     }
-    // The original selector has already run its capability check. An
-    // explicit FSR session uses renderer 7 every time it queries this.
-    *field::<8>(image, 0x007e_9421)? = [0xb8, 7, 0, 0, 0, 0x90, 0x90, 0x90];
-    // Record the SDK mode and jump to the scaled-scene branch.
-    *field::<14>(image, 0x028e_f69a)? = [
-        0xb8,
-        preset.mode(),
-        0,
-        0,
-        0,
-        0x41,
-        0x89,
-        0x86,
-        0x90,
-        0,
-        0,
-        0,
-        0xeb,
-        0x0a,
-    ];
-    if preset != FsrPreset::Quality {
+    // An explicit FSR session uses renderer 7 every time it queries this. A
+    // native session leaves that choice to the title.
+    if preset != FsrPreset::Native {
+        *field::<8>(image, 0x007e_9421)? = [0xb8, 7, 0, 0, 0, 0x90, 0x90, 0x90];
+    }
+    if preset == FsrPreset::Native {
+        // Store zero and stay on the no-FSR branch: `xor eax,eax; mov
+        // [r14+0x90],eax; test al,al; jne +0x0a (not taken); nop`, the same
+        // length as the code replaced.
+        *field::<14>(image, 0x028e_f69a)? = [
+            0x31, 0xc0, 0x41, 0x89, 0x86, 0x90, 0, 0, 0, 0x84, 0xc0, 0x75, 0x0a, 0x90,
+        ];
+    } else {
+        // Record the SDK mode and jump to the scaled-scene branch.
+        *field::<14>(image, 0x028e_f69a)? = [
+            0xb8,
+            preset.mode(),
+            0,
+            0,
+            0,
+            0x41,
+            0x89,
+            0x86,
+            0x90,
+            0,
+            0,
+            0,
+            0xeb,
+            0x0a,
+        ];
+    }
+    if scaled {
         // The jump makes the native-scale instruction unreachable. Reuse
         // its RIP operand bytes for a private literal, leaving the constants
         // used by other passes unchanged.
@@ -131,7 +159,7 @@ pub(super) fn prepare_fsr_4k(image: &mut PreparedImage, preset: FsrPreset) -> Re
         *field::<4>(image, QUALITY_LOAD + 4)? = displacement.to_le_bytes();
     }
     tracing::info!(
-        renderer = 7,
+        renderer = (preset != FsrPreset::Native).then_some(7),
         preset = preset.name(),
         quality = preset.mode(),
         expected_render = ?preset.render_size(),
@@ -165,6 +193,7 @@ mod tests {
         };
         let bytes = std::fs::read(path).unwrap();
         for (preset, size) in [
+            (FsrPreset::Native, [3840, 2160]),
             (FsrPreset::Quality, [2560, 1440]),
             (FsrPreset::Balanced, [2258, 1270]),
             (FsrPreset::Performance, [1920, 1080]),
@@ -176,19 +205,30 @@ mod tests {
             assert_eq!(*field::<16>(&mut image, SDR_MODE).unwrap(), STOCK_SDR_MODE);
             assert_eq!(*field::<5>(&mut image, 0x0247_ad4a).unwrap(), scanout);
             assert_eq!(*field::<8>(&mut image, 0x0580_48d4).unwrap(), settings);
-            assert_eq!(
-                *field::<4>(&mut image, 0x007e_9422).unwrap(),
-                7u32.to_le_bytes()
-            );
-            assert_eq!(
-                *field::<4>(&mut image, 0x028e_f69b).unwrap(),
-                u32::from(preset.mode()).to_le_bytes()
-            );
+            if preset == FsrPreset::Native {
+                // The no-FSR branch: zero stored, and both the renderer
+                // choice and the 1.0 native scale left as the title has them.
+                assert_eq!(*field::<2>(&mut image, 0x028e_f69a).unwrap(), [0x31, 0xc0]);
+                assert_eq!(*field::<4>(&mut image, 0x007e_9422).unwrap(), 6u32.to_le_bytes());
+                let disp = i32::from_le_bytes(*field::<4>(&mut image, 0x028e_f6ac).unwrap());
+                let reference = 0x028e_f6b0_u32.wrapping_add_signed(disp);
+                let scale = f32::from_le_bytes(*field::<4>(&mut image, reference).unwrap());
+                assert_eq!(scale, 1.0);
+            } else {
+                assert_eq!(
+                    *field::<4>(&mut image, 0x007e_9422).unwrap(),
+                    7u32.to_le_bytes()
+                );
+                assert_eq!(
+                    *field::<4>(&mut image, 0x028e_f69b).unwrap(),
+                    u32::from(preset.mode()).to_le_bytes()
+                );
+                let disp = i32::from_le_bytes(*field::<4>(&mut image, 0x028e_f6b6).unwrap());
+                let reference = 0x028e_f6ba_u32.wrapping_add_signed(disp);
+                let scale = f32::from_le_bytes(*field::<4>(&mut image, reference).unwrap());
+                assert_eq!([3840.0, 2160.0].map(|w| (w * scale) as u32), size);
+            }
             assert_eq!(preset.render_size(), size);
-            let disp = i32::from_le_bytes(*field::<4>(&mut image, 0x028e_f6b6).unwrap());
-            let reference = 0x028e_f6ba_u32.wrapping_add_signed(disp);
-            let scale = f32::from_le_bytes(*field::<4>(&mut image, reference).unwrap());
-            assert_eq!([3840.0, 2160.0].map(|w| (w * scale) as u32), size);
         }
     }
 }

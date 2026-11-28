@@ -2,7 +2,7 @@
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
-# -Fsr4K        PC FidelityFX at 3840x2160 (quality by default; balanced or performance for speed, 0 for the console's own)
+# -Fsr4K        PC FidelityFX at 3840x2160 (native by default: the scene rendered at 3840x2160; quality, balanced or performance render smaller and upscale, 0 for the console's own)
 # -Console      series-x (default) or series-s
 # -Uncap        no frame-rate limit at all (VICTORY_FRAME_INTERVAL_MS=0, VICTORY_TITLE_FPS=0); an experiment, not a playable setting
 # -Memory       the memory trims ported from victory-memory-stack (indirect budgets packed, command allocators taken anew)
@@ -13,7 +13,7 @@ param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Safe,
     [switch]$RayTracing,
-    [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
+    [ValidateSet('native', 'quality', 'balanced', 'performance')][string]$Fsr4K,
     [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
     [switch]$Uncap,
     [switch]$Memory,
@@ -25,10 +25,11 @@ $settings = @{
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '1'
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'
-    # The title's FSR frontend at 4K (renderer 7, 2560x1440 rendered and upscaled): sharper than
-    # the console's own choice on this PC. `-Fsr4K` picks another; `-More @{VICTORY_FSR_4K='0'}`
-    # leaves it to the console.
-    VICTORY_FSR_4K = 'quality'
+    # Native 4K: the title's own no-FSR branch renders the scene at 3840x2160 (the temporal
+    # renderer is left as the title chose it). `-Fsr4K quality` (2560x1440 rendered and
+    # upscaled) or `balanced`/`performance` trades sharpness for speed; `-More
+    # @{VICTORY_FSR_4K='0'}` leaves it to the console.
+    VICTORY_FSR_4K = 'native'
 }
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
